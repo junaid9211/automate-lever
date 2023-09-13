@@ -1,0 +1,2974 @@
+//
+// **Bugsnag.js** is the official JavaScript notifier for
+// [Bugsnag](https://bugsnag.com).
+//
+// Bugsnag gives you instant notification of errors and
+// exceptions in your website's JavaScript code.
+//
+// Bugsnag.js is incredibly small, and has no external dependencies (not even
+// jQuery!) so you can safely use it on any website.
+//
+
+// The `Bugsnag` object is the only globally exported variable
+(function (window, old) {
+  var self = {},
+    lastScript,
+    previousNotification,
+    shouldCatch = true,
+    ignoreOnError = 0,
+    breadcrumbs = [],
+    breadcrumbHardLimit = 40,
+    placeholderErrorName = "BugsnagNotify",
+
+    // We've seen cases where individual clients can infinite loop sending us errors
+    // (in some cases 10,000+ errors per page). This limit is at the point where
+    // you've probably learned everything useful there is to debug the problem,
+    // and we're happy to under-estimate the count to save the client (and Bugsnag's) resources.
+    eventsRemaining = 10,
+    // The default depth of attached metadata which is parsed before truncation. It
+    // is configurable via the `maxDepth` setting.
+    maxPayloadDepth = 5;
+
+
+  // Set default breadcrumbLimit to 20, so we don't send a giant payload.
+  // This can be overridden up to the breadcrumbHardLimit
+  self.breadcrumbLimit = 20;
+
+  // #### Bugsnag.noConflict
+  //
+  // This is obsolete with UMD, as we cannot assume the global scope is polluted with
+  // the Bugsnag object anyway. In this case, it's up to the host Javascript file to
+  // correctly utilise this functionality.
+  //
+  // Maybe it's worth removing all together, if we're loading via any UMD method.
+  self.noConflict = function() {
+    window.Bugsnag = old;
+    if (typeof old === "undefined") {
+      delete window.Bugsnag;
+    }
+    return self;
+  };
+
+  // ### Bugsnag.refresh
+  //
+  // Resets the Bugsnag rate limit. If you have a large single-page app, you may
+  // wish to call this in your router to avoid exception reports being thrown
+  // away.
+  //
+  // By default Bugsnag aggressively limits the number of exception reports from
+  // one page load. This protects both the client's browser and our servers in
+  // cases where exceptions are thrown in tight loops or scroll handlers.
+  self.refresh = function() {
+    eventsRemaining = 10;
+  };
+
+  //
+  // ### Manual error notification (public methods)
+  //
+
+  // #### Bugsnag.notifyException
+  //
+  // Notify Bugsnag about a given `exception`, typically that you've caught
+  // with a `try/catch` statement or that you've generated yourself.
+  //
+  // It's almost always better to let an exception bubble rather than catching
+  // it, as that gives more consistent behaviour across browsers. Consider
+  // re-throwing instead of calling .notifyException.
+  //
+  // Since most JavaScript exceptions use the `Error` class, we also allow
+  // you to provide a custom error name when calling `notifyException`.
+  //
+  // The default value is "warning" and "error" and "info" are also supported by the
+  // backend, all other values cause the notification to be dropped; and you
+  // will not see it in your dashboard.
+  self.notifyException = function (exception, name, metaData, severity) {
+    if (!exception) {
+      var message = "Bugsnag.notifyException() was called with no arguments";
+      log(message);
+      self.notify(placeholderErrorName, message);
+      return;
+    }
+
+    if (typeof exception === "string") {
+      log(
+        "Bugsnag.notifyException() was called with a string. Expected instance of Error. " +
+        "To send a custom message instantiate a new Error or use Bugsnag.notify('<string>')." +
+        " see https://docs.bugsnag.com/platforms/browsers/#reporting-handled-exceptions"
+      );
+      // pass through to notify()
+      self.notify.apply(null, arguments);
+      return;
+    }
+
+    if (name && typeof name !== "string") {
+      metaData = name;
+      name = undefined;
+    }
+    if (!metaData) {
+      metaData = {};
+    }
+    addScriptToMetaData(metaData);
+
+    sendToBugsnag({
+      name: name || exception.name,
+      message: exception.message || exception.description,
+      stacktrace: stacktraceFromException(exception) || generateStacktrace(),
+      file: exception.fileName || exception.sourceURL,
+      lineNumber: exception.lineNumber || exception.line,
+      columnNumber: exception.columnNumber ? exception.columnNumber + 1 : undefined,
+      severity: severity
+    }, metaData, {
+      originalSeverity: "warning",
+      unhandled: false,
+      severityReason: { type: "handledException" }
+    });
+  };
+
+  // #### Bugsnag.notify
+  //
+  // Notify Bugsnag about an error by passing in a `name` and `message`,
+  // without requiring an exception.
+  self.notify = function (name, message, metaData, severity) {
+    if (!name) {
+      name = placeholderErrorName;
+      message = "Bugsnag.notify() was called with no arguments";
+      log(message);
+    }
+
+    sendToBugsnag({
+      name: name,
+      message: message,
+      stacktrace: generateStacktrace(),
+      // These are defaults so that 'bugsnag.notify()' calls show up in old IE,
+      // newer browsers get a legit stacktrace from generateStacktrace().
+      file: window.location.toString(),
+      lineNumber: 1,
+      severity: severity
+    }, metaData, {
+      originalSeverity: "warning",
+      unhandled: false,
+      severityReason: { type: "handledError" }
+    });
+  };
+
+  // #### Bugsnag.leaveBreadcrumb(value, [metaData])
+  //
+  // Add a breadcrumb to the array of breadcrumbs to be sent to Bugsnag when the next exception occurs
+  // - `value` (string|object) If this is an object, it will be used as the entire breadcrumb object
+  //   and any missing `type`, `name` or `timestamp` fields will get default values.
+  //   if this is a string and metaData is provided, then `value` will be used as the `name` of the
+  //   breadcrumb.
+  //   if `value` is a string and is the only argument the breadcrumb will have `manual` type and
+  //   the value will be used as the `message` field of `metaData`.
+  //
+  // - `metadata` (optional, object) - Additional information about the breadcrumb. Values limited to 140 characters.
+  self.leaveBreadcrumb = function(value, metaData) {
+    var DEFAULT_TYPE = "manual";
+
+    // default crumb
+    var crumb = {
+      type: DEFAULT_TYPE,
+      name: "Manual",
+      timestamp: new Date().getTime()
+    };
+
+    switch (typeof value) {
+    case "object":
+      crumb = merge(crumb, value);
+      break;
+    case "string":
+      if (metaData && typeof metaData === "object") {
+        crumb = merge(crumb, {
+          name: value,
+          metaData: metaData
+        });
+      } else {
+        crumb.metaData = { message: value };
+      }
+      break;
+    default:
+      log("expecting 1st argument to leaveBreadcrumb to be a 'string' or 'object', got " + typeof value);
+      return;
+    }
+
+    // Validate breadcrumb type and replace invalid type with default.
+    var VALID_TYPES = [DEFAULT_TYPE, "error", "log", "navigation", "process", "request", "state", "user"];
+    var validType = false;
+    for (var i = 0; i < VALID_TYPES.length; i++) {
+      if (VALID_TYPES[i] === crumb.type) {
+        validType = true;
+        break;
+      }
+    }
+    if (!validType) {
+      log("Converted invalid breadcrumb type '" + crumb.type + "' to '" + DEFAULT_TYPE + "'");
+      crumb.type = DEFAULT_TYPE;
+    }
+
+    var lastCrumb = breadcrumbs.slice(-1)[0];
+    if (breadcrumbsAreEqual(crumb, lastCrumb)) {
+      lastCrumb.count = lastCrumb.count || 1;
+      lastCrumb.count++;
+    } else {
+      var breadcrumbLimit = Math.min(self.breadcrumbLimit, breadcrumbHardLimit);
+      crumb.name = truncate(crumb.name, 32);
+      breadcrumbs.push(truncateDeep(crumb, 140));
+
+      // limit breadcrumb trail length, so the payload doesn't get too large
+      if (breadcrumbs.length > breadcrumbLimit) {
+        breadcrumbs = breadcrumbs.slice(-breadcrumbLimit);
+      }
+    }
+  };
+
+  function breadcrumbsAreEqual(crumb1, crumb2) {
+    return crumb1 && crumb2 &&
+      crumb1.type === crumb2.type &&
+      crumb1.name === crumb2.name &&
+      isEqual(crumb1.metaData, crumb2.metaData);
+  }
+
+  // Return a function acts like the given function, but reports
+  // any exceptions to Bugsnag before re-throwing them.
+  //
+  // This is not a public function because it can only be used if
+  // the exception is not caught after being thrown out of this function.
+  //
+  // If you call wrap twice on the same function, it'll give you back the
+  // same wrapped function. This lets removeEventListener to continue to
+  // work.
+  function wrap(_super) {
+    try {
+      if (typeof _super !== "function") {
+        return _super;
+      }
+      if (!_super.bugsnag) {
+        var currentScript = getCurrentScript();
+        _super.bugsnag = function () {
+          lastScript = currentScript;
+
+          // We set shouldCatch to false on IE < 10 because catching the error ruins the file/line as reported in window.onerror,
+          // We set shouldCatch to false on Chrome/Safari because it interferes with "break on unhandled exception"
+          // All other browsers need shouldCatch to be true, as they don't pass the exception object to window.onerror
+          if (shouldCatch) {
+            try {
+              return _super.apply(this, arguments);
+            } catch (e) {
+              if (getSetting("autoNotify", true)) {
+                var metaData = {};
+                addScriptToMetaData(metaData);
+                sendToBugsnag({
+                  name: e.name,
+                  message: e.message,
+                  stacktrace: stacktraceFromException(e) || generateStacktrace(),
+                  file: e.fileName || e.sourceURL,
+                  lineNumber: e.lineNumber || e.line,
+                  columnNumber: e.columnNumber ? e.columnNumber + 1 : undefined
+                }, metaData, {
+                  originalSeverity: "error",
+                  unhandled: true,
+                  severityReason: { type: "unhandledException" }
+                });
+                ignoreNextOnError();
+              }
+              throw e;
+            } finally {
+              lastScript = null;
+            }
+          } else {
+            var ret = _super.apply(this, arguments);
+            // in case of error, this is set to null in window.onerror
+            lastScript = null;
+            return ret;
+          }
+        };
+        _super.bugsnag.bugsnag = _super.bugsnag;
+      }
+      return _super.bugsnag;
+
+    // This can happen if _super is not a normal javascript function.
+    // For example, see https://github.com/bugsnag/bugsnag-js/issues/28
+    } catch (e) {
+      return _super;
+    }
+  }
+
+  var _hasAddEventListener = (typeof window.addEventListener !== "undefined");
+
+  // Setup breadcrumbs for click events
+  function setupClickBreadcrumbs() {
+    if (!_hasAddEventListener) {
+      return;
+    }
+
+    var callback = function(event) {
+      if(!getBreadcrumbSetting("autoBreadcrumbsClicks")) {
+        return;
+      }
+
+      var targetText, targetSelector;
+      // Cross origin security might prevent us from accessing the event target
+
+      try {
+        targetText = nodeText(event.target);
+        targetSelector = nodeLabel(event.target);
+      } catch (e) {
+        targetText = "[hidden]";
+        targetSelector = "[hidden]";
+        log("Cross domain error when tracking click event. See https://docs.bugsnag.com/platforms/browsers/faq/#3-cross-origin-script-errors");
+      }
+
+      self.leaveBreadcrumb({
+        type: "user",
+        name: "UI click",
+        metaData: {
+          targetText: targetText,
+          targetSelector: targetSelector
+        }
+      });
+    };
+
+    window.addEventListener("click", callback, true);
+  }
+
+  // stub functions for old browsers
+  self.enableAutoBreadcrumbsConsole = function() {};
+  self.disableAutoBreadcrumbsConsole = function() {};
+
+  // Setup breadcrumbs for console.log, console.warn, console.error
+  function setupConsoleBreadcrumbs(){
+
+    function trackLog(severity, args) {
+      if(!getBreadcrumbSetting("autoBreadcrumbsConsole")) {
+        return;
+      }
+
+      self.leaveBreadcrumb({
+        type: "log",
+        name: "Console output",
+        metaData: {
+          severity: severity,
+          message: Array.prototype.slice.call(args).join(", ")
+        }
+      });
+    }
+
+    // feature detection for console.log
+    if(typeof window.console === "undefined") {
+      return;
+    }
+
+    // keep track of functions that we will need to hijack
+    var nativeLog = console.log,
+      nativeWarn = console.warn,
+      nativeError = console.error,
+      nativeGroup = console.group,
+      nativeGroupCollapsed = console.groupCollapsed;
+
+    self.enableAutoBreadcrumbsConsole = function() {
+      self.autoBreadcrumbsConsole = true;
+
+      enhance(console, "log", function() {
+        trackLog("log", arguments);
+      });
+
+      enhance(console, "warn", function() {
+        trackLog("warn", arguments);
+      });
+
+      enhance(console, "error", function() {
+        trackLog("error", arguments);
+      });
+
+      enhance(console, "group", function() {
+        trackLog("log", [ "[group]" ].concat(Array.prototype.slice.call(arguments)));
+      });
+
+      enhance(console, "groupCollapsed", function() {
+        trackLog("log", [ "[group]" ].concat(Array.prototype.slice.call(arguments)));
+      });
+    };
+
+    self.disableAutoBreadcrumbsConsole = function() {
+      self.autoBreadcrumbsConsole = false;
+
+      console.log = nativeLog;
+      console.warn = nativeWarn;
+      console.error = nativeError;
+      console.group = nativeGroup;
+      console.groupCollapsed = nativeGroupCollapsed;
+    };
+
+    if(getBreadcrumbSetting("autoBreadcrumbsConsole")) {
+      self.enableAutoBreadcrumbsConsole();
+    }
+  }
+
+  // stub functions for old browsers
+  self.enableAutoBreadcrumbsNavigation = function() {};
+  self.disableAutoBreadcrumbsNavigation = function() {};
+
+  // Setup breadcrumbs for history navigation events
+  function setupNavigationBreadcrumbs() {
+
+    function parseHash(url) {
+      return url.split("#")[1] || "";
+    }
+
+    function buildHashChange(event) {
+      var oldURL = event.oldURL,
+        newURL = event.newURL,
+        metaData = {};
+
+      // not supported in old browsers
+      if (oldURL && newURL) {
+        metaData.from = parseHash(oldURL);
+        metaData.to = parseHash(newURL);
+      } else {
+        metaData.to = location.hash;
+      }
+
+      return {
+        type: "navigation",
+        name: "Hash changed",
+        metaData: metaData
+      };
+    }
+
+    function buildPopState() {
+      return {
+        type: "navigation",
+        name: "Navigated back"
+      };
+    }
+
+    function buildPageHide() {
+      return {
+        type: "navigation",
+        name: "Page hidden"
+      };
+    }
+
+    function buildPageShow() {
+      return {
+        type: "navigation",
+        name: "Page shown"
+      };
+    }
+
+    function buildLoad() {
+      return {
+        type: "navigation",
+        name: "Page loaded"
+      };
+    }
+
+    function buildDOMContentLoaded() {
+      return {
+        type: "navigation",
+        name: "DOMContentLoaded"
+      };
+    }
+
+    function buildStateChange(name, state, title, url) {
+      var currentPath = location.pathname + location.search + location.hash;
+      return {
+        type: "navigation",
+        name: "History " + name,
+        metaData: {
+          from: currentPath,
+          to: url || currentPath,
+          prevState: history.state,
+          nextState: state
+        }
+      };
+    }
+
+    function buildPushState(state, title, url) {
+      return buildStateChange("pushState", state, title, url);
+    }
+
+    function buildReplaceState(state, title, url) {
+      return buildStateChange("replaceState", state, title, url);
+    }
+
+    // functional fu to make it easier to setup event listeners
+    function wrapBuilder(builder) {
+      return function() {
+        if(!getBreadcrumbSetting("autoBreadcrumbsNavigation")) {
+          return;
+        }
+
+        self.leaveBreadcrumb(builder.apply(null, arguments));
+      };
+    }
+
+    // check for browser support
+    if (!_hasAddEventListener ||
+        !window.history ||
+        !window.history.state ||
+        !window.history.pushState ||
+        !window.history.pushState.bind
+    ) {
+      return;
+    }
+
+    // keep track of native functions
+    var nativePushState = history.pushState,
+      nativeReplaceState = history.replaceState;
+
+    // create enable function
+    self.enableAutoBreadcrumbsNavigation = function() {
+      self.autoBreadcrumbsNavigation = true;
+      // create hooks for pushstate and replaceState
+      enhance(history, "pushState", wrapBuilder(buildPushState));
+      enhance(history, "replaceState", wrapBuilder(buildReplaceState));
+    };
+
+    // create disable function
+    self.disableAutoBreadcrumbsNavigation = function() {
+      self.autoBreadcrumbsNavigation = false;
+      // restore native functions
+      history.pushState = nativePushState;
+      history.replaceState = nativeReplaceState;
+    };
+
+    window.addEventListener("hashchange", wrapBuilder(buildHashChange), true);
+    window.addEventListener("popstate", wrapBuilder(buildPopState), true);
+    window.addEventListener("pagehide", wrapBuilder(buildPageHide), true);
+    window.addEventListener("pageshow", wrapBuilder(buildPageShow), true);
+    window.addEventListener("load", wrapBuilder(buildLoad), true);
+    window.addEventListener("DOMContentLoaded", wrapBuilder(buildDOMContentLoaded), true);
+
+    if(getBreadcrumbSetting("autoBreadcrumbsNavigation")) {
+      self.enableAutoBreadcrumbsNavigation();
+    }
+  }
+
+  self.enableAutoBreadcrumbsErrors = function() {
+    self.autoBreadcrumbsErrors = true;
+  };
+
+  self.disableAutoBreadcrumbsErrors = function() {
+    self.autoBreadcrumbsErrors = false;
+  };
+
+  self.enableAutoBreadcrumbsClicks = function() {
+    self.autoBreadcrumbsClicks = true;
+  };
+
+  self.disableAutoBreadcrumbsClicks = function() {
+    self.autoBreadcrumbsClicks = false;
+  };
+
+  self.enableAutoBreadcrumbs = function() {
+    self.enableAutoBreadcrumbsClicks();
+    self.enableAutoBreadcrumbsConsole();
+    self.enableAutoBreadcrumbsErrors();
+    self.enableAutoBreadcrumbsNavigation();
+  };
+
+  self.disableAutoBreadcrumbs = function() {
+    self.disableAutoBreadcrumbsClicks();
+    self.disableAutoBreadcrumbsConsole();
+    self.disableAutoBreadcrumbsErrors();
+    self.disableAutoBreadcrumbsNavigation();
+  };
+
+  self.enableNotifyUnhandledRejections = function() {
+    self.notifyUnhandledRejections = true;
+  };
+
+  self.disableNotifyUnhandledRejections = function() {
+    self.notifyUnhandledRejections = false;
+  };
+
+  //
+  // ### Script tag tracking
+  //
+
+  // To emulate document.currentScript we use document.scripts.last.
+  // This only works while synchronous scripts are running, so we track
+  // that here.
+  var synchronousScriptsRunning = document.readyState !== "complete";
+  function loadCompleted() {
+    synchronousScriptsRunning = false;
+  }
+
+  // from jQuery. We don't have quite such tight bounds as they do if
+  // we end up on the window.onload event as we don't try and hack
+  // the .scrollLeft() fix in because it doesn't work in frames so
+  // we'd need these fallbacks anyway.
+  // The worst that can happen is we group an event handler that fires
+  // before us into the last script tag.
+  if (document.addEventListener) {
+    document.addEventListener("DOMContentLoaded", loadCompleted, true);
+    window.addEventListener("load", loadCompleted, true);
+  } else {
+    window.attachEvent("onload", loadCompleted);
+  }
+
+  function getCurrentScript() {
+    var script = document.currentScript || lastScript;
+
+    if (!script && synchronousScriptsRunning) {
+      var scripts = document.scripts || document.getElementsByTagName("script");
+      script = scripts[scripts.length - 1];
+    }
+
+    return script;
+  }
+
+  function addScriptToMetaData(metaData) {
+    var script = getCurrentScript();
+
+    if (script) {
+      metaData.script = {
+        src: script.src,
+        content: getSetting("inlineScript", true) ? script.innerHTML : ""
+      };
+    }
+  }
+
+  //
+  // ### Helpers & Setup
+  //
+
+  // Compile regular expressions upfront.
+  var API_KEY_REGEX = /^[0-9a-f]{32}$/i;
+  var FUNCTION_REGEX = /function\s*([\w\-$]+)?\s*\(/i;
+
+  // Set up default notifier settings.
+  var DEFAULT_BASE_ENDPOINT = "https://notify.bugsnag.com/";
+  var DEFAULT_NOTIFIER_ENDPOINT = DEFAULT_BASE_ENDPOINT + "js";
+  var NOTIFIER_VERSION = "3.3.2";
+
+  // Keep a reference to the currently executing script in the DOM.
+  // We'll use this later to extract settings from attributes.
+  var scripts = document.getElementsByTagName("script");
+  var thisScript = scripts[scripts.length - 1];
+
+  // Replace existing function on object with custom one, but still call the original afterwards
+  // example:
+  //  enhance(console, 'log', function() {
+  //    /* custom behavior */
+  //  })
+  function enhance(object, property, newFunction) {
+    var oldFunction = object[property];
+    object[property] = function() {
+      newFunction.apply(this, arguments);
+      if (typeof oldFunction === "function") {
+        oldFunction.apply(this, arguments);
+      }
+    };
+  }
+
+  // Simple logging function that wraps `console.log` if available.
+  // This is useful for warning about configuration issues
+  // eg. forgetting to set an API key.
+  function log(msg) {
+    var disableLog = getSetting("disableLog");
+
+    var console = window.console;
+    if (console !== undefined && console.log !== undefined && !disableLog) {
+      console.log("[Bugsnag] " + msg);
+    }
+  }
+
+  // Compare if two objects are equal.
+  function isEqual(obj1, obj2) {
+    return serialize(obj1) === serialize(obj2);
+  }
+
+  // extract text content from a element
+  function nodeText(el) {
+    var text = el.textContent || el.innerText || "";
+
+    if (el.type === "submit" || el.type === "button") {
+      text = el.value;
+    }
+
+    text = text.replace(/^\s+|\s+$/g, ""); // trim whitespace
+    return truncate(text, 140);
+  }
+
+  // Create a label from tagname, id and css class of the element
+  function nodeLabel(el) {
+    var parts = [el.tagName];
+
+    if (el.id) {
+      parts.push("#" + el.id);
+    }
+
+    if (el.className && el.className.length) {
+      var classString = "." + el.className.split(" ").join(".");
+      parts.push(classString);
+    }
+
+    var label = parts.join("");
+
+    if (!document.querySelectorAll || !Array.prototype.indexOf) {
+      // can't get much more advanced with the current browser
+      return label;
+    }
+
+    try {
+      if (document.querySelectorAll(label).length === 1) {
+        return label;
+      }
+    } catch (e) {
+      // sometime the query selector can be invalid, for example, if the id attribute is anumber.
+      // in these cases, just return the label as is.
+      return label;
+    }
+
+    // try to get a more specific selector if this one matches more than one element
+    if (el.parentNode.childNodes.length > 1) {
+      var index = Array.prototype.indexOf.call(el.parentNode.childNodes, el) + 1;
+      label = label + ":nth-child(" + index + ")";
+    }
+
+    if (document.querySelectorAll(label).length === 1) {
+      return label;
+    }
+
+    // try prepending the parent node selector
+    if (el.parentNode) {
+      return nodeLabel(el.parentNode) + " > " + label;
+    }
+
+    return label;
+  }
+
+  function truncate(value, length) {
+    var OMISSION = "(...)";
+
+    if (value && value.length > length) {
+      return value.slice(0, length - OMISSION.length) + OMISSION;
+    } else {
+      return value;
+    }
+  }
+
+  function isArray(arg) {
+    return Object.prototype.toString.call(arg) === "[object Array]";
+  }
+
+  // truncate all string values in nested object
+  function truncateDeep(object, length, depth) {
+    var newDepth = (depth || 0) + 1;
+    var setting = getSetting("maxDepth", maxPayloadDepth);
+
+    if (depth > setting) {
+      return "[RECURSIVE]";
+    }
+
+    // Handle truncating strings
+    if (typeof object === "string") {
+      return truncate(object, length);
+
+    // Handle truncating array contents
+    } else if (isArray(object)) {
+      var newArray = [];
+      for (var i = 0; i < object.length; i++) {
+        newArray[i] = truncateDeep(object[i], length, newDepth);
+      }
+      return newArray;
+
+    // Handle truncating object keys
+    } if (typeof object === "object" && object != null) {
+      var newObject = {};
+      for (var key in object) {
+        if (Object.prototype.hasOwnProperty.call(object, key)) {
+          newObject[key] = truncateDeep(object[key], length, newDepth);
+        }
+      }
+      return newObject;
+
+    // Just return everything else (numbers, booleans, functions, etc.)
+    } else {
+      return object;
+    }
+  }
+
+  // Deeply serialize an object into a query string. We use the PHP-style
+  // nested object syntax, `nested[keys]=val`, to support heirachical
+  // objects. Similar to jQuery's `$.param` method.
+  function serialize(obj, prefix, depth) {
+    var maxDepth = getSetting("maxDepth", maxPayloadDepth);
+
+    if (depth >= maxDepth) {
+      return encodeURIComponent(prefix) + "=[RECURSIVE]";
+    }
+    depth = depth + 1 || 1;
+
+    try {
+      if (window.Node && obj instanceof window.Node) {
+        return encodeURIComponent(prefix) + "=" + encodeURIComponent(targetToString(obj));
+      }
+
+      var str = [];
+      for (var p in obj) {
+        if ((!obj.hasOwnProperty || obj.hasOwnProperty(p)) && p != null && obj[p] != null) {
+          var k = prefix ? prefix + "[" + p + "]" : p, v = obj[p];
+          str.push(typeof v === "object" ? serialize(v, k, depth) : encodeURIComponent(k) + "=" + encodeURIComponent(v));
+        }
+      }
+      return str.sort().join("&");
+    } catch (e) {
+      return encodeURIComponent(prefix) + "=" + encodeURIComponent("" + e);
+    }
+  }
+
+  // export this as a method for use in tests
+  self._serialize = serialize;
+
+
+  // Deep-merge the `source` object into the `target` object and return
+  // the `target`. Properties in source that will overwrite those in target.
+  // Similar to jQuery's `$.extend` method.
+  function merge(target, source, depth) {
+    if (source == null) {
+      return target;
+    } else if (depth >= getSetting("maxDepth", maxPayloadDepth)) {
+      return "[RECURSIVE]";
+    }
+
+    target = target || {};
+    for (var key in source) {
+      if (source.hasOwnProperty(key)) {
+        try {
+          if (source[key].constructor === Object) {
+            target[key] = merge(target[key], source[key], depth + 1 || 1);
+          } else {
+            target[key] = source[key];
+          }
+        } catch (e) {
+          target[key] = source[key];
+        }
+      }
+    }
+
+    return target;
+  }
+
+  // Make a HTTP request with given `url` and `params` object.
+  // For maximum browser compatibility and cross-domain support, requests are
+  // made by creating a temporary JavaScript `Image` object.
+  // Additionally the request can be done via XHR (needed for Chrome apps and extensions)
+  // To set the script to use XHR, you can specify data-notifyhandler attribute in the script tag
+  // Eg. `<script data-notifyhandler="xhr">` - the request defaults to image if attribute is not set
+  function request(url, params) {
+    url += "?" + serialize(params) + "&ct=img&cb=" + new Date().getTime();
+    if (typeof BUGSNAG_TESTING !== "undefined" && self.testRequest) {
+      self.testRequest(url, params);
+    } else {
+      var notifyHandler = getSetting("notifyHandler");
+      if (notifyHandler === "xhr") {
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", url, true);
+        xhr.send();
+      } else {
+        var img = new Image();
+        img.src = url;
+      }
+    }
+  }
+
+  // Extract all `data-*` attributes from a DOM element and return them as an
+  // object. This is used to allow Bugsnag settings to be set via attributes
+  // on the `script` tag, eg. `<script data-apikey="xyz">`.
+  // Similar to jQuery's `$(el).data()` method.
+  function getData(node) {
+    var dataAttrs = {};
+    var dataRegex = /^data\-([\w\-]+)$/;
+
+    // If the node doesn't exist due to being loaded as a commonjs module,
+    // then return an empty object and fallback to self[].
+    if (node) {
+      var attrs = node.attributes;
+      for (var i = 0; i < attrs.length; i++) {
+        var attr = attrs[i];
+        if (dataRegex.test(attr.nodeName)) {
+          var key = attr.nodeName.match(dataRegex)[1];
+          dataAttrs[key] = attr.value || attr.nodeValue;
+        }
+      }
+    }
+
+    return dataAttrs;
+  }
+
+  // Get configuration settings from either `self` (the `Bugsnag` object)
+  // or `data` (the `data-*` attributes).
+  var data;
+  function getSetting(name, fallback) {
+    data = data || getData(thisScript);
+    var setting = self[name] !== undefined ? self[name] : data[name.toLowerCase()];
+    if (setting === "false") {
+      setting = false;
+    }
+    // some settings may need extracting from comma separated strings -> arrays
+    if (name === "notifyReleaseStages" && typeof setting === "string") {
+      setting = setting.split(/\s*,\s*/);
+    }
+    return setting !== undefined ? setting : fallback;
+  }
+
+  // Validate a Bugsnag API key exists and is of the correct format.
+  function validateApiKey(apiKey) {
+    if (!apiKey || !apiKey.match(API_KEY_REGEX)) {
+      log("Invalid API key '" + apiKey + "'");
+      return false;
+    }
+
+    return true;
+  }
+
+  // get breadcrumb specific setting. When autoBreadcrumbs is true, all individual events are defaulted
+  // to true. Otherwise they will all default to false. You can set any event specifically and it will override
+  // the default.
+  function getBreadcrumbSetting(name) {
+    var fallback = getSetting("autoBreadcrumbs", true);
+    return getSetting(name, fallback);
+  }
+
+  // Send an error to Bugsnag.
+  function sendToBugsnag(details, metaData, handledState) {
+    // Validate the configured API key.
+    var apiKey = getSetting("apiKey");
+    if (!validateApiKey(apiKey) || !eventsRemaining) {
+      return;
+    }
+
+    eventsRemaining -= 1;
+
+    // Check if we should notify for this release stage.
+    var releaseStage = getSetting("releaseStage", "production");
+    var notifyReleaseStages = getSetting("notifyReleaseStages");
+    if (notifyReleaseStages) {
+      var shouldNotify = false;
+      for (var i = 0; i < notifyReleaseStages.length; i++) {
+        if (releaseStage === notifyReleaseStages[i]) {
+          shouldNotify = true;
+          break;
+        }
+      }
+
+      if (!shouldNotify) {
+        return;
+      }
+    }
+
+    // Don't send multiple copies of the same error.
+    // This fixes a problem when a client goes into an infinite loop,
+    // and starts wasting all their bandwidth sending messages to bugsnag.
+    var deduplicate = [details.name, details.message, details.stacktrace].join("|");
+    if (deduplicate === previousNotification) {
+      return;
+    } else {
+      previousNotification = deduplicate;
+    }
+
+    var defaultEventMetaData = {
+      device: { time: (new Date()).getTime() }
+    };
+
+    // Build the request payload by combining error information with other data
+    // such as user-agent and locale, `metaData` and settings.
+    var payload = {
+      notifierVersion: NOTIFIER_VERSION,
+
+      apiKey: apiKey,
+      projectRoot: getSetting("projectRoot") || window.location.protocol + "//" + window.location.host,
+      context: getSetting("context") || window.location.pathname,
+      user: getSetting("user"),
+      metaData: merge(merge(defaultEventMetaData, getSetting("metaData")), metaData),
+      releaseStage: releaseStage,
+      appVersion: getSetting("appVersion"),
+
+      url: window.location.href,
+      userAgent: navigator.userAgent,
+      language: navigator.language || navigator.userLanguage,
+
+      severity: details.severity,
+
+      name: details.name,
+      message: details.message,
+      stacktrace: details.stacktrace,
+      file: details.file,
+      lineNumber: details.lineNumber,
+      columnNumber: details.columnNumber,
+      breadcrumbs: breadcrumbs,
+      payloadVersion: "3"
+    };
+
+    // did the user set severity?
+    var userSeverity = details.severity;
+    var userSpecifiedSeverity = userSeverity && userSeverity !== handledState.originalSeverity;
+
+    // annotate this property so that we can check if the "beforeNotify" callbacks changed it
+    // can't annotate a string literal ""/'', so create a String() object, woo!
+    if (userSpecifiedSeverity) {
+      payload.severity = new String(userSpecifiedSeverity);
+      payload.severity.__userSpecifiedSeverity = true;
+    }
+
+    // Run any `beforeNotify` function
+    var beforeNotify = self.beforeNotify;
+    if (typeof(beforeNotify) === "function") {
+      var retVal = beforeNotify(payload, payload.metaData);
+      if (retVal === false) {
+        return;
+      }
+    }
+
+    // did any of the the callbacks set the severity?
+    var callbackSeverity = payload.severity;
+    var callbackSetSeverity = callbackSeverity && !callbackSeverity.__userSpecifiedSeverity && callbackSeverity !== handledState.originalSeverity;
+
+    if (callbackSetSeverity) {
+      // callbacks set a valid severity value
+      payload.severity = callbackSeverity;
+      payload.severityReason = { type: "userCallbackSetSeverity" };
+    } else if (userSpecifiedSeverity) {
+      // user specified a valid severity value
+      payload.severity = userSeverity;
+      payload.severityReason = { type: "userSpecifiedSeverity" };
+    } else {
+      // user did not specify severity, or specified and invalid value
+      payload.severity = handledState.originalSeverity;
+      payload.severityReason = handledState.severityReason;
+    }
+
+    // finally, add whether the error was unhandled so that callbacks can't fiddle with it
+    payload.unhandled = handledState.unhandled;
+
+    if (payload.lineNumber === 0 && (/Script error\.?/).test(payload.message)) {
+      return log("Ignoring cross-domain or eval script error. See https://docs.bugsnag.com/platforms/browsers/faq/#3-cross-origin-script-errors");
+    }
+
+    // Make the HTTP request
+    request(getSetting("endpoint") || DEFAULT_NOTIFIER_ENDPOINT, payload);
+  }
+
+  // Generate a browser stacktrace (or approximation) from the current stack.
+  // This is used to add a stacktrace to `Bugsnag.notify` calls, and to add a
+  // stacktrace approximation where we can't get one from an exception.
+  function generateStacktrace() {
+    var generated, stacktrace;
+    var MAX_FAKE_STACK_SIZE = 10;
+    var ANONYMOUS_FUNCTION_PLACEHOLDER = "[anonymous]";
+
+    // Try to generate a real stacktrace (most browsers, except IE9 and below).
+    try {
+      throw new Error("");
+    } catch (exception) {
+      generated = "<generated>\n";
+      stacktrace = stacktraceFromException(exception);
+    }
+
+    // Otherwise, build a fake stacktrace from the list of method names by
+    // looping through the list of functions that called this one (and skip
+    // whoever called us).
+    if (!stacktrace) {
+      generated = "<generated-ie>\n";
+      var functionStack = [];
+      try {
+        var curr = arguments.callee.caller.caller;
+        while (curr && functionStack.length < MAX_FAKE_STACK_SIZE) {
+          var fn = FUNCTION_REGEX.test(curr.toString()) ? RegExp.$1 || ANONYMOUS_FUNCTION_PLACEHOLDER : ANONYMOUS_FUNCTION_PLACEHOLDER;
+          functionStack.push(fn);
+          curr = curr.caller;
+        }
+      } catch (e) {
+        log(e);
+      }
+      stacktrace = functionStack.join("\n");
+    }
+
+    // Tell the backend to ignore the first two lines in the stack-trace.
+    // generateStacktrace() + window.onerror,
+    // generateStacktrace() + notify,
+    // generateStacktrace() + notifyException
+    return generated + stacktrace;
+  }
+
+  // Get the stacktrace string from an exception
+  function stacktraceFromException(exception) {
+    return exception.stack || exception.backtrace || exception.stacktrace;
+  }
+
+  // Convert a DOM element into a string suitable for passing to Bugsnag.
+  function targetToString(target) {
+    if (target) {
+      var attrs = target.attributes;
+
+      if (attrs) {
+        var ret = "<" + target.nodeName.toLowerCase();
+        for (var i = 0; i < attrs.length; i++) {
+          if (attrs[i].value && attrs[i].value.toString() !== "null") {
+            ret += " " + attrs[i].name + "=\"" + attrs[i].value + "\"";
+          }
+        }
+        return ret + ">";
+      } else {
+         // e.g. #document
+        return target.nodeName;
+      }
+    }
+  }
+
+  // If we've notified bugsnag of an exception in wrap, we don't want to
+  // re-notify when it hits window.onerror after we re-throw it.
+  function ignoreNextOnError() {
+    ignoreOnError += 1;
+    window.setTimeout(function () {
+      ignoreOnError -= 1;
+    });
+  }
+
+  // Disable catching on IE < 10 as it destroys stack-traces from generateStackTrace()
+  if (!window.atob) {
+    shouldCatch = false;
+
+  // Disable catching on browsers that support HTML5 ErrorEvents properly.
+  // This lets debug on unhandled exceptions work.
+  } else if (window.ErrorEvent) {
+    try {
+      if (new window.ErrorEvent("test").colno === 0) {
+        shouldCatch = false;
+      }
+    } catch(e){ /* No action needed */ }
+  }
+
+
+  //
+  // ### Polyfilling
+  //
+
+  // Add a polyFill to an object
+  function polyFill(obj, name, makeReplacement) {
+    var original = obj[name];
+    var replacement = makeReplacement(original);
+    obj[name] = replacement;
+
+    if (typeof BUGSNAG_TESTING !== "undefined" && window.undo) {
+      window.undo.push(function () {
+        obj[name] = original;
+      });
+    }
+  }
+
+  if (getSetting("autoNotify", true)) {
+    //
+    // ### Automatic error notification
+    //
+    // Attach to `window.onerror` events and notify Bugsnag when they happen.
+    // These are mostly js compile/parse errors, but on some browsers all
+    // "uncaught" exceptions will fire this event.
+    //
+    polyFill(window, "onerror", function (_super) {
+      // Keep a reference to any existing `window.onerror` handler
+      if (typeof BUGSNAG_TESTING !== "undefined") {
+        self._onerror = _super;
+      }
+
+      return function bugsnag(message, url, lineNo, charNo, exception) {
+        var shouldNotify = getSetting("autoNotify", true);
+        var metaData = {};
+
+        // IE 6+ support.
+        if (!charNo && window.event) {
+          charNo = window.event.errorCharacter;
+        }
+
+        addScriptToMetaData(metaData);
+        lastScript = null;
+
+        if (shouldNotify && !ignoreOnError) {
+          var name, msg;
+          if (arguments.length === 1) {
+            // if called with a single argument, "message" is likely an Event object
+            // as documented here: https://developer.mozilla.org/en/docs/Web/API/GlobalEventHandlers/onerror#Syntax
+            name = message && message.type ? ("Event: " + message.type) : "window.onerror";
+            msg = message && message.detail ? message.detail : undefined;
+            metaData.event = message;
+          } else {
+            name = exception && exception.name || "window.onerror";
+            msg = message;
+          }
+          sendToBugsnag({
+            name: name,
+            message: msg,
+            file: url,
+            lineNumber: lineNo,
+            columnNumber: charNo,
+            stacktrace: (exception && stacktraceFromException(exception)) || generateStacktrace()
+          }, metaData, {
+            originalSeverity: "error",
+            unhandled: true,
+            severityReason: { type: "unhandledException" }
+          });
+
+          // add the error to the breadcrumbs
+          if (getBreadcrumbSetting("autoBreadcrumbsErrors")) {
+            self.leaveBreadcrumb({
+              type: "error",
+              name: name,
+              metaData: {
+                severity: "error",
+                file: url,
+                message: msg,
+                line: lineNo
+              }
+            });
+          }
+        }
+
+        if (typeof BUGSNAG_TESTING !== "undefined") {
+          _super = self._onerror;
+        }
+
+        // Fire the existing `window.onerror` handler, if one exists
+        if (_super) {
+          _super(message, url, lineNo, charNo, exception);
+        }
+      };
+    });
+
+    var hijackTimeFunc = function (_super) {
+      // Note, we don't do `_super.call` because that doesn't work on IE 8,
+      // luckily this is implicitly window so it just works everywhere.
+      //
+      // setTimout in all browsers except IE <9 allows additional parameters
+      // to be passed, so in order to support these without resorting to call/apply
+      // we need an extra layer of wrapping.
+      return function (f, t) {
+        if (typeof f === "function") {
+          f = wrap(f);
+          var args = Array.prototype.slice.call(arguments, 2);
+          return _super(function () {
+            f.apply(this, args);
+          }, t);
+        } else {
+          return _super(f, t);
+        }
+      };
+    };
+
+    polyFill(window, "setTimeout", hijackTimeFunc);
+    polyFill(window, "setInterval", hijackTimeFunc);
+
+    if (window.requestAnimationFrame) {
+      polyFill(window, "requestAnimationFrame", function (_super) {
+        return function (callback) {
+          return _super(wrap(callback));
+        };
+      });
+    }
+
+    if (window.setImmediate) {
+      polyFill(window, "setImmediate", function (_super) {
+        return function () {
+          var args = Array.prototype.slice.call(arguments);
+          args[0] = wrap(args[0]);
+          return _super.apply(this, args);
+        };
+      });
+    }
+
+    if ("onunhandledrejection" in window) {
+      // browsers with promise support have `addEventListener`
+      window.addEventListener("unhandledrejection", function (event) {
+        if (getSetting("notifyUnhandledRejections", false)) {
+          var err = event.reason;
+          if (!err) {
+            err = {};
+          }
+          var metaData = {};
+          addScriptToMetaData(metaData);
+          if (!err.message) {
+            metaData.promiseRejectionValue = err;
+          }
+          sendToBugsnag({
+            name: err.name ? err.name : "UnhandledRejection",
+            message: err.message ? err.message : "",
+            stacktrace: stacktraceFromException(err) || generateStacktrace(),
+            file: err.fileName || err.sourceURL,
+            lineNumber: err.lineNumber || err.line,
+            columnNumber: err.columnNumber ? err.columnNumber + 1 : undefined
+          }, metaData, {
+            originalSeverity: "error",
+            unhandled: true,
+            severityReason: { type: "unhandledPromiseRejection" }
+          });
+        }
+      });
+    }
+
+    // EventTarget is all that's required in modern chrome/opera
+    // EventTarget + Window + ModalWindow is all that's required in modern FF (there are a few Moz prefixed ones that we're ignoring)
+    // The rest is a collection of stuff for Safari and IE 11. (Again ignoring a few MS and WebKit prefixed things)
+    "EventTarget Window Node ApplicationCache AudioTrackList ChannelMergerNode CryptoOperation EventSource FileReader HTMLUnknownElement IDBDatabase IDBRequest IDBTransaction KeyOperation MediaController MessagePort ModalWindow Notification SVGElementInstance Screen TextTrack TextTrackCue TextTrackList WebSocket WebSocketWorker Worker XMLHttpRequest XMLHttpRequestEventTarget XMLHttpRequestUpload".replace(/\w+/g, function (global) {
+      var prototype = window[global] && window[global].prototype;
+      if (prototype && prototype.hasOwnProperty && prototype.hasOwnProperty("addEventListener")) {
+        polyFill(prototype, "addEventListener", function (_super) {
+          return function (e, f, capture, secure) {
+            // HTML lets event-handlers be objects with a handlEvent function,
+            // we need to change f.handleEvent here, as self.wrap will ignore f.
+            try {
+              if (f && f.handleEvent) {
+                f.handleEvent = wrap(f.handleEvent);
+              }
+            } catch (err) {
+              // When selenium is installed, we sometimes get 'Permission denied to access property "handleEvent"'
+              // Because this catch is around Bugsnag library code, it won't catch any user errors
+              log(err);
+            }
+            return _super.call(this, e, wrap(f), capture, secure);
+          };
+        });
+
+        // We also need to hack removeEventListener so that you can remove any
+        // event listeners.
+        polyFill(prototype, "removeEventListener", function (_super) {
+          return function (e, f, capture, secure) {
+            _super.call(this, e, f, capture, secure);
+            return _super.call(this, e, wrap(f), capture, secure);
+          };
+        });
+      }
+    });
+  }
+
+  // setup auto breadcrumb tracking
+  setupClickBreadcrumbs();
+  setupConsoleBreadcrumbs();
+  setupNavigationBreadcrumbs();
+
+  // Leave the initial breadcrumb
+  if (getSetting("autoBreadcrumbs", true)) {
+    self.leaveBreadcrumb({ type: "navigation", name: "Bugsnag Loaded" });
+  }
+
+  window.Bugsnag = self;
+  // If people are using a javascript loader, we should integrate with it.
+  // We don't want to defer instrumenting their code with callbacks however,
+  // so we slightly abuse the intent and continue with our plan of polyfilling
+  // the browser whether or not they ever actually require the module.
+  // This has the nice side-effect of continuing to work when people are using
+  // AMD but loading Bugsnag via a CDN.
+  // It has the not-so-nice side-effect of polluting the global namespace, but
+  // you can easily call Bugsnag.noConflict() to fix that.
+  if (typeof define === "function" && define.amd) {
+    // AMD
+    define([], function () {
+      return self;
+    });
+  } else if (typeof module === "object" && typeof module.exports === "object") {
+    // CommonJS/Browserify
+    module.exports = self;
+  }
+})(window, window.Bugsnag);
+        ¥{ x ˇˇ     20230512001631-8l$   https://jobs.lever.co/js/bug-snag.js       ‰≤  //
+// **Bugsnag.js** is the official JavaScript notifier for
+// [Bugsnag](https://bugsnag.com).
+//
+// Bugsnag gives you instant notification of errors and
+// exceptions in your website's JavaScript code.
+//
+// Bugsnag.js is incredibly small, and has no external dependencies (not even
+// jQuery!) so you can safely use it on any website.
+//
+
+// The `Bugsnag` object is the only globally exported variable
+(function (window, old) {
+  var self = {},
+    lastScript,
+    previousNotification,
+    shouldCatch = true,
+    ignoreOnError = 0,
+    breadcrumbs = [],
+    breadcrumbHardLimit = 40,
+    placeholderErrorName = "BugsnagNotify",
+
+    // We've seen cases where individual clients can infinite loop sending us errors
+    // (in some cases 10,000+ errors per page). This limit is at the point where
+    // you've probably learned everything useful there is to debug the problem,
+    // and we're happy to under-estimate the count to save the client (and Bugsnag's) resources.
+    eventsRemaining = 10,
+    // The default depth of attached metadata which is parsed before truncation. It
+    // is configurable via the `maxDepth` setting.
+    maxPayloadDepth = 5;
+
+
+  // Set default breadcrumbLimit to 20, so we don't send a giant payload.
+  // This can be overridden up to the breadcrumbHardLimit
+  self.breadcrumbLimit = 20;
+
+  // #### Bugsnag.noConflict
+  //
+  // This is obsolete with UMD, as we cannot assume the global scope is polluted with
+  // the Bugsnag object anyway. In this case, it's up to the host Javascript file to
+  // correctly utilise this functionality.
+  //
+  // Maybe it's worth removing all together, if we're loading via any UMD method.
+  self.noConflict = function() {
+    window.Bugsnag = old;
+    if (typeof old === "undefined") {
+      delete window.Bugsnag;
+    }
+    return self;
+  };
+
+  // ### Bugsnag.refresh
+  //
+  // Resets the Bugsnag rate limit. If you have a large single-page app, you may
+  // wish to call this in your router to avoid exception reports being thrown
+  // away.
+  //
+  // By default Bugsnag aggressively limits the number of exception reports from
+  // one page load. This protects both the client's browser and our servers in
+  // cases where exceptions are thrown in tight loops or scroll handlers.
+  self.refresh = function() {
+    eventsRemaining = 10;
+  };
+
+  //
+  // ### Manual error notification (public methods)
+  //
+
+  // #### Bugsnag.notifyException
+  //
+  // Notify Bugsnag about a given `exception`, typically that you've caught
+  // with a `try/catch` statement or that you've generated yourself.
+  //
+  // It's almost always better to let an exception bubble rather than catching
+  // it, as that gives more consistent behaviour across browsers. Consider
+  // re-throwing instead of calling .notifyException.
+  //
+  // Since most JavaScript exceptions use the `Error` class, we also allow
+  // you to provide a custom error name when calling `notifyException`.
+  //
+  // The default value is "warning" and "error" and "info" are also supported by the
+  // backend, all other values cause the notification to be dropped; and you
+  // will not see it in your dashboard.
+  self.notifyException = function (exception, name, metaData, severity) {
+    if (!exception) {
+      var message = "Bugsnag.notifyException() was called with no arguments";
+      log(message);
+      self.notify(placeholderErrorName, message);
+      return;
+    }
+
+    if (typeof exception === "string") {
+      log(
+        "Bugsnag.notifyException() was called with a string. Expected instance of Error. " +
+        "To send a custom message instantiate a new Error or use Bugsnag.notify('<string>')." +
+        " see https://docs.bugsnag.com/platforms/browsers/#reporting-handled-exceptions"
+      );
+      // pass through to notify()
+      self.notify.apply(null, arguments);
+      return;
+    }
+
+    if (name && typeof name !== "string") {
+      metaData = name;
+      name = undefined;
+    }
+    if (!metaData) {
+      metaData = {};
+    }
+    addScriptToMetaData(metaData);
+
+    sendToBugsnag({
+      name: name || exception.name,
+      message: exception.message || exception.description,
+      stacktrace: stacktraceFromException(exception) || generateStacktrace(),
+      file: exception.fileName || exception.sourceURL,
+      lineNumber: exception.lineNumber || exception.line,
+      columnNumber: exception.columnNumber ? exception.columnNumber + 1 : undefined,
+      severity: severity
+    }, metaData, {
+      originalSeverity: "warning",
+      unhandled: false,
+      severityReason: { type: "handledException" }
+    });
+  };
+
+  // #### Bugsnag.notify
+  //
+  // Notify Bugsnag about an error by passing in a `name` and `message`,
+  // without requiring an exception.
+  self.notify = function (name, message, metaData, severity) {
+    if (!name) {
+      name = placeholderErrorName;
+      message = "Bugsnag.notify() was called with no arguments";
+      log(message);
+    }
+
+    sendToBugsnag({
+      name: name,
+      message: message,
+      stacktrace: generateStacktrace(),
+      // These are defaults so that 'bugsnag.notify()' calls show up in old IE,
+      // newer browsers get a legit stacktrace from generateStacktrace().
+      file: window.location.toString(),
+      lineNumber: 1,
+      severity: severity
+    }, metaData, {
+      originalSeverity: "warning",
+      unhandled: false,
+      severityReason: { type: "handledError" }
+    });
+  };
+
+  // #### Bugsnag.leaveBreadcrumb(value, [metaData])
+  //
+  // Add a breadcrumb to the array of breadcrumbs to be sent to Bugsnag when the next exception occurs
+  // - `value` (string|object) If this is an object, it will be used as the entire breadcrumb object
+  //   and any missing `type`, `name` or `timestamp` fields will get default values.
+  //   if this is a string and metaData is provided, then `value` will be used as the `name` of the
+  //   breadcrumb.
+  //   if `value` is a string and is the only argument the breadcrumb will have `manual` type and
+  //   the value will be used as the `message` field of `metaData`.
+  //
+  // - `metadata` (optional, object) - Additional information about the breadcrumb. Values limited to 140 characters.
+  self.leaveBreadcrumb = function(value, metaData) {
+    var DEFAULT_TYPE = "manual";
+
+    // default crumb
+    var crumb = {
+      type: DEFAULT_TYPE,
+      name: "Manual",
+      timestamp: new Date().getTime()
+    };
+
+    switch (typeof value) {
+    case "object":
+      crumb = merge(crumb, value);
+      break;
+    case "string":
+      if (metaData && typeof metaData === "object") {
+        crumb = merge(crumb, {
+          name: value,
+          metaData: metaData
+        });
+      } else {
+        crumb.metaData = { message: value };
+      }
+      break;
+    default:
+      log("expecting 1st argument to leaveBreadcrumb to be a 'string' or 'object', got " + typeof value);
+      return;
+    }
+
+    // Validate breadcrumb type and replace invalid type with default.
+    var VALID_TYPES = [DEFAULT_TYPE, "error", "log", "navigation", "process", "request", "state", "user"];
+    var validType = false;
+    for (var i = 0; i < VALID_TYPES.length; i++) {
+      if (VALID_TYPES[i] === crumb.type) {
+        validType = true;
+        break;
+      }
+    }
+    if (!validType) {
+      log("Converted invalid breadcrumb type '" + crumb.type + "' to '" + DEFAULT_TYPE + "'");
+      crumb.type = DEFAULT_TYPE;
+    }
+
+    var lastCrumb = breadcrumbs.slice(-1)[0];
+    if (breadcrumbsAreEqual(crumb, lastCrumb)) {
+      lastCrumb.count = lastCrumb.count || 1;
+      lastCrumb.count++;
+    } else {
+      var breadcrumbLimit = Math.min(self.breadcrumbLimit, breadcrumbHardLimit);
+      crumb.name = truncate(crumb.name, 32);
+      breadcrumbs.push(truncateDeep(crumb, 140));
+
+      // limit breadcrumb trail length, so the payload doesn't get too large
+      if (breadcrumbs.length > breadcrumbLimit) {
+        breadcrumbs = breadcrumbs.slice(-breadcrumbLimit);
+      }
+    }
+  };
+
+  function breadcrumbsAreEqual(crumb1, crumb2) {
+    return crumb1 && crumb2 &&
+      crumb1.type === crumb2.type &&
+      crumb1.name === crumb2.name &&
+      isEqual(crumb1.metaData, crumb2.metaData);
+  }
+
+  // Return a function acts like the given function, but reports
+  // any exceptions to Bugsnag before re-throwing them.
+  //
+  // This is not a public function because it can only be used if
+  // the exception is not caught after being thrown out of this function.
+  //
+  // If you call wrap twice on the same function, it'll give you back the
+  // same wrapped function. This lets removeEventListener to continue to
+  // work.
+  function wrap(_super) {
+    try {
+      if (typeof _super !== "function") {
+        return _super;
+      }
+      if (!_super.bugsnag) {
+        var currentScript = getCurrentScript();
+        _super.bugsnag = function () {
+          lastScript = currentScript;
+
+          // We set shouldCatch to false on IE < 10 because catching the error ruins the file/line as reported in window.onerror,
+          // We set shouldCatch to false on Chrome/Safari because it interferes with "break on unhandled exception"
+          // All other browsers need shouldCatch to be true, as they don't pass the exception object to window.onerror
+          if (shouldCatch) {
+            try {
+              return _super.apply(this, arguments);
+            } catch (e) {
+              if (getSetting("autoNotify", true)) {
+                var metaData = {};
+                addScriptToMetaData(metaData);
+                sendToBugsnag({
+                  name: e.name,
+                  message: e.message,
+                  stacktrace: stacktraceFromException(e) || generateStacktrace(),
+                  file: e.fileName || e.sourceURL,
+                  lineNumber: e.lineNumber || e.line,
+                  columnNumber: e.columnNumber ? e.columnNumber + 1 : undefined
+                }, metaData, {
+                  originalSeverity: "error",
+                  unhandled: true,
+                  severityReason: { type: "unhandledException" }
+                });
+                ignoreNextOnError();
+              }
+              throw e;
+            } finally {
+              lastScript = null;
+            }
+          } else {
+            var ret = _super.apply(this, arguments);
+            // in case of error, this is set to null in window.onerror
+            lastScript = null;
+            return ret;
+          }
+        };
+        _super.bugsnag.bugsnag = _super.bugsnag;
+      }
+      return _super.bugsnag;
+
+    // This can happen if _super is not a normal javascript function.
+    // For example, see https://github.com/bugsnag/bugsnag-js/issues/28
+    } catch (e) {
+      return _super;
+    }
+  }
+
+  var _hasAddEventListener = (typeof window.addEventListener !== "undefined");
+
+  // Setup breadcrumbs for click events
+  function setupClickBreadcrumbs() {
+    if (!_hasAddEventListener) {
+      return;
+    }
+
+    var callback = function(event) {
+      if(!getBreadcrumbSetting("autoBreadcrumbsClicks")) {
+        return;
+      }
+
+      var targetText, targetSelector;
+      // Cross origin security might prevent us from accessing the event target
+
+      try {
+        targetText = nodeText(event.target);
+        targetSelector = nodeLabel(event.target);
+      } catch (e) {
+        targetText = "[hidden]";
+        targetSelector = "[hidden]";
+        log("Cross domain error when tracking click event. See https://docs.bugsnag.com/platforms/browsers/faq/#3-cross-origin-script-errors");
+      }
+
+      self.leaveBreadcrumb({
+        type: "user",
+        name: "UI click",
+        metaData: {
+          targetText: targetText,
+          targetSelector: targetSelector
+        }
+      });
+    };
+
+    window.addEventListener("click", callback, true);
+  }
+
+  // stub functions for old browsers
+  self.enableAutoBreadcrumbsConsole = function() {};
+  self.disableAutoBreadcrumbsConsole = function() {};
+
+  // Setup breadcrumbs for console.log, console.warn, console.error
+  function setupConsoleBreadcrumbs(){
+
+    function trackLog(severity, args) {
+      if(!getBreadcrumbSetting("autoBreadcrumbsConsole")) {
+        return;
+      }
+
+      self.leaveBreadcrumb({
+        type: "log",
+        name: "Console output",
+        metaData: {
+          severity: severity,
+          message: Array.prototype.slice.call(args).join(", ")
+        }
+      });
+    }
+
+    // feature detection for console.log
+    if(typeof window.console === "undefined") {
+      return;
+    }
+
+    // keep track of functions that we will need to hijack
+    var nativeLog = console.log,
+      nativeWarn = console.warn,
+      nativeError = console.error,
+      nativeGroup = console.group,
+      nativeGroupCollapsed = console.groupCollapsed;
+
+    self.enableAutoBreadcrumbsConsole = function() {
+      self.autoBreadcrumbsConsole = true;
+
+      enhance(console, "log", function() {
+        trackLog("log", arguments);
+      });
+
+      enhance(console, "warn", function() {
+        trackLog("warn", arguments);
+      });
+
+      enhance(console, "error", function() {
+        trackLog("error", arguments);
+      });
+
+      enhance(console, "group", function() {
+        trackLog("log", [ "[group]" ].concat(Array.prototype.slice.call(arguments)));
+      });
+
+      enhance(console, "groupCollapsed", function() {
+        trackLog("log", [ "[group]" ].concat(Array.prototype.slice.call(arguments)));
+      });
+    };
+
+    self.disableAutoBreadcrumbsConsole = function() {
+      self.autoBreadcrumbsConsole = false;
+
+      console.log = nativeLog;
+      console.warn = nativeWarn;
+      console.error = nativeError;
+      console.group = nativeGroup;
+      console.groupCollapsed = nativeGroupCollapsed;
+    };
+
+    if(getBreadcrumbSetting("autoBreadcrumbsConsole")) {
+      self.enableAutoBreadcrumbsConsole();
+    }
+  }
+
+  // stub functions for old browsers
+  self.enableAutoBreadcrumbsNavigation = function() {};
+  self.disableAutoBreadcrumbsNavigation = function() {};
+
+  // Setup breadcrumbs for history navigation events
+  function setupNavigationBreadcrumbs() {
+
+    function parseHash(url) {
+      return url.split("#")[1] || "";
+    }
+
+    function buildHashChange(event) {
+      var oldURL = event.oldURL,
+        newURL = event.newURL,
+        metaData = {};
+
+      // not supported in old browsers
+      if (oldURL && newURL) {
+        metaData.from = parseHash(oldURL);
+        metaData.to = parseHash(newURL);
+      } else {
+        metaData.to = location.hash;
+      }
+
+      return {
+        type: "navigation",
+        name: "Hash changed",
+        metaData: metaData
+      };
+    }
+
+    function buildPopState() {
+      return {
+        type: "navigation",
+        name: "Navigated back"
+      };
+    }
+
+    function buildPageHide() {
+      return {
+        type: "navigation",
+        name: "Page hidden"
+      };
+    }
+
+    function buildPageShow() {
+      return {
+        type: "navigation",
+        name: "Page shown"
+      };
+    }
+
+    function buildLoad() {
+      return {
+        type: "navigation",
+        name: "Page loaded"
+      };
+    }
+
+    function buildDOMContentLoaded() {
+      return {
+        type: "navigation",
+        name: "DOMContentLoaded"
+      };
+    }
+
+    function buildStateChange(name, state, title, url) {
+      var currentPath = location.pathname + location.search + location.hash;
+      return {
+        type: "navigation",
+        name: "History " + name,
+        metaData: {
+          from: currentPath,
+          to: url || currentPath,
+          prevState: history.state,
+          nextState: state
+        }
+      };
+    }
+
+    function buildPushState(state, title, url) {
+      return buildStateChange("pushState", state, title, url);
+    }
+
+    function buildReplaceState(state, title, url) {
+      return buildStateChange("replaceState", state, title, url);
+    }
+
+    // functional fu to make it easier to setup event listeners
+    function wrapBuilder(builder) {
+      return function() {
+        if(!getBreadcrumbSetting("autoBreadcrumbsNavigation")) {
+          return;
+        }
+
+        self.leaveBreadcrumb(builder.apply(null, arguments));
+      };
+    }
+
+    // check for browser support
+    if (!_hasAddEventListener ||
+        !window.history ||
+        !window.history.state ||
+        !window.history.pushState ||
+        !window.history.pushState.bind
+    ) {
+      return;
+    }
+
+    // keep track of native functions
+    var nativePushState = history.pushState,
+      nativeReplaceState = history.replaceState;
+
+    // create enable function
+    self.enableAutoBreadcrumbsNavigation = function() {
+      self.autoBreadcrumbsNavigation = true;
+      // create hooks for pushstate and replaceState
+      enhance(history, "pushState", wrapBuilder(buildPushState));
+      enhance(history, "replaceState", wrapBuilder(buildReplaceState));
+    };
+
+    // create disable function
+    self.disableAutoBreadcrumbsNavigation = function() {
+      self.autoBreadcrumbsNavigation = false;
+      // restore native functions
+      history.pushState = nativePushState;
+      history.replaceState = nativeReplaceState;
+    };
+
+    window.addEventListener("hashchange", wrapBuilder(buildHashChange), true);
+    window.addEventListener("popstate", wrapBuilder(buildPopState), true);
+    window.addEventListener("pagehide", wrapBuilder(buildPageHide), true);
+    window.addEventListener("pageshow", wrapBuilder(buildPageShow), true);
+    window.addEventListener("load", wrapBuilder(buildLoad), true);
+    window.addEventListener("DOMContentLoaded", wrapBuilder(buildDOMContentLoaded), true);
+
+    if(getBreadcrumbSetting("autoBreadcrumbsNavigation")) {
+      self.enableAutoBreadcrumbsNavigation();
+    }
+  }
+
+  self.enableAutoBreadcrumbsErrors = function() {
+    self.autoBreadcrumbsErrors = true;
+  };
+
+  self.disableAutoBreadcrumbsErrors = function() {
+    self.autoBreadcrumbsErrors = false;
+  };
+
+  self.enableAutoBreadcrumbsClicks = function() {
+    self.autoBreadcrumbsClicks = true;
+  };
+
+  self.disableAutoBreadcrumbsClicks = function() {
+    self.autoBreadcrumbsClicks = false;
+  };
+
+  self.enableAutoBreadcrumbs = function() {
+    self.enableAutoBreadcrumbsClicks();
+    self.enableAutoBreadcrumbsConsole();
+    self.enableAutoBreadcrumbsErrors();
+    self.enableAutoBreadcrumbsNavigation();
+  };
+
+  self.disableAutoBreadcrumbs = function() {
+    self.disableAutoBreadcrumbsClicks();
+    self.disableAutoBreadcrumbsConsole();
+    self.disableAutoBreadcrumbsErrors();
+    self.disableAutoBreadcrumbsNavigation();
+  };
+
+  self.enableNotifyUnhandledRejections = function() {
+    self.notifyUnhandledRejections = true;
+  };
+
+  self.disableNotifyUnhandledRejections = function() {
+    self.notifyUnhandledRejections = false;
+  };
+
+  //
+  // ### Script tag tracking
+  //
+
+  // To emulate document.currentScript we use document.scripts.last.
+  // This only works while synchronous scripts are running, so we track
+  // that here.
+  var synchronousScriptsRunning = document.readyState !== "complete";
+  function loadCompleted() {
+    synchronousScriptsRunning = false;
+  }
+
+  // from jQuery. We don't have quite such tight bounds as they do if
+  // we end up on the window.onload event as we don't try and hack
+  // the .scrollLeft() fix in because it doesn't work in frames so
+  // we'd need these fallbacks anyway.
+  // The worst that can happen is we group an event handler that fires
+  // before us into the last script tag.
+  if (document.addEventListener) {
+    document.addEventListener("DOMContentLoaded", loadCompleted, true);
+    window.addEventListener("load", loadCompleted, true);
+  } else {
+    window.attachEvent("onload", loadCompleted);
+  }
+
+  function getCurrentScript() {
+    var script = document.currentScript || lastScript;
+
+    if (!script && synchronousScriptsRunning) {
+      var scripts = document.scripts || document.getElementsByTagName("script");
+      script = scripts[scripts.length - 1];
+    }
+
+    return script;
+  }
+
+  function addScriptToMetaData(metaData) {
+    var script = getCurrentScript();
+
+    if (script) {
+      metaData.script = {
+        src: script.src,
+        content: getSetting("inlineScript", true) ? script.innerHTML : ""
+      };
+    }
+  }
+
+  //
+  // ### Helpers & Setup
+  //
+
+  // Compile regular expressions upfront.
+  var API_KEY_REGEX = /^[0-9a-f]{32}$/i;
+  var FUNCTION_REGEX = /function\s*([\w\-$]+)?\s*\(/i;
+
+  // Set up default notifier settings.
+  var DEFAULT_BASE_ENDPOINT = "https://notify.bugsnag.com/";
+  var DEFAULT_NOTIFIER_ENDPOINT = DEFAULT_BASE_ENDPOINT + "js";
+  var NOTIFIER_VERSION = "3.3.2";
+
+  // Keep a reference to the currently executing script in the DOM.
+  // We'll use this later to extract settings from attributes.
+  var scripts = document.getElementsByTagName("script");
+  var thisScript = scripts[scripts.length - 1];
+
+  // Replace existing function on object with custom one, but still call the original afterwards
+  // example:
+  //  enhance(console, 'log', function() {
+  //    /* custom behavior */
+  //  })
+  function enhance(object, property, newFunction) {
+    var oldFunction = object[property];
+    object[property] = function() {
+      newFunction.apply(this, arguments);
+      if (typeof oldFunction === "function") {
+        oldFunction.apply(this, arguments);
+      }
+    };
+  }
+
+  // Simple logging function that wraps `console.log` if available.
+  // This is useful for warning about configuration issues
+  // eg. forgetting to set an API key.
+  function log(msg) {
+    var disableLog = getSetting("disableLog");
+
+    var console = window.console;
+    if (console !== undefined && console.log !== undefined && !disableLog) {
+      console.log("[Bugsnag] " + msg);
+    }
+  }
+
+  // Compare if two objects are equal.
+  function isEqual(obj1, obj2) {
+    return serialize(obj1) === serialize(obj2);
+  }
+
+  // extract text content from a element
+  function nodeText(el) {
+    var text = el.textContent || el.innerText || "";
+
+    if (el.type === "submit" || el.type === "button") {
+      text = el.value;
+    }
+
+    text = text.replace(/^\s+|\s+$/g, ""); // trim whitespace
+    return truncate(text, 140);
+  }
+
+  // Create a label from tagname, id and css class of the element
+  function nodeLabel(el) {
+    var parts = [el.tagName];
+
+    if (el.id) {
+      parts.push("#" + el.id);
+    }
+
+    if (el.className && el.className.length) {
+      var classString = "." + el.className.split(" ").join(".");
+      parts.push(classString);
+    }
+
+    var label = parts.join("");
+
+    if (!document.querySelectorAll || !Array.prototype.indexOf) {
+      // can't get much more advanced with the current browser
+      return label;
+    }
+
+    try {
+      if (document.querySelectorAll(label).length === 1) {
+        return label;
+      }
+    } catch (e) {
+      // sometime the query selector can be invalid, for example, if the id attribute is anumber.
+      // in these cases, just return the label as is.
+      return label;
+    }
+
+    // try to get a more specific selector if this one matches more than one element
+    if (el.parentNode.childNodes.length > 1) {
+      var index = Array.prototype.indexOf.call(el.parentNode.childNodes, el) + 1;
+      label = label + ":nth-child(" + index + ")";
+    }
+
+    if (document.querySelectorAll(label).length === 1) {
+      return label;
+    }
+
+    // try prepending the parent node selector
+    if (el.parentNode) {
+      return nodeLabel(el.parentNode) + " > " + label;
+    }
+
+    return label;
+  }
+
+  function truncate(value, length) {
+    var OMISSION = "(...)";
+
+    if (value && value.length > length) {
+      return value.slice(0, length - OMISSION.length) + OMISSION;
+    } else {
+      return value;
+    }
+  }
+
+  function isArray(arg) {
+    return Object.prototype.toString.call(arg) === "[object Array]";
+  }
+
+  // truncate all string values in nested object
+  function truncateDeep(object, length, depth) {
+    var newDepth = (depth || 0) + 1;
+    var setting = getSetting("maxDepth", maxPayloadDepth);
+
+    if (depth > setting) {
+      return "[RECURSIVE]";
+    }
+
+    // Handle truncating strings
+    if (typeof object === "string") {
+      return truncate(object, length);
+
+    // Handle truncating array contents
+    } else if (isArray(object)) {
+      var newArray = [];
+      for (var i = 0; i < object.length; i++) {
+        newArray[i] = truncateDeep(object[i], length, newDepth);
+      }
+      return newArray;
+
+    // Handle truncating object keys
+    } if (typeof object === "object" && object != null) {
+      var newObject = {};
+      for (var key in object) {
+        if (Object.prototype.hasOwnProperty.call(object, key)) {
+          newObject[key] = truncateDeep(object[key], length, newDepth);
+        }
+      }
+      return newObject;
+
+    // Just return everything else (numbers, booleans, functions, etc.)
+    } else {
+      return object;
+    }
+  }
+
+  // Deeply serialize an object into a query string. We use the PHP-style
+  // nested object syntax, `nested[keys]=val`, to support heirachical
+  // objects. Similar to jQuery's `$.param` method.
+  function serialize(obj, prefix, depth) {
+    var maxDepth = getSetting("maxDepth", maxPayloadDepth);
+
+    if (depth >= maxDepth) {
+      return encodeURIComponent(prefix) + "=[RECURSIVE]";
+    }
+    depth = depth + 1 || 1;
+
+    try {
+      if (window.Node && obj instanceof window.Node) {
+        return encodeURIComponent(prefix) + "=" + encodeURIComponent(targetToString(obj));
+      }
+
+      var str = [];
+      for (var p in obj) {
+        if ((!obj.hasOwnProperty || obj.hasOwnProperty(p)) && p != null && obj[p] != null) {
+          var k = prefix ? prefix + "[" + p + "]" : p, v = obj[p];
+          str.push(typeof v === "object" ? serialize(v, k, depth) : encodeURIComponent(k) + "=" + encodeURIComponent(v));
+        }
+      }
+      return str.sort().join("&");
+    } catch (e) {
+      return encodeURIComponent(prefix) + "=" + encodeURIComponent("" + e);
+    }
+  }
+
+  // export this as a method for use in tests
+  self._serialize = serialize;
+
+
+  // Deep-merge the `source` object into the `target` object and return
+  // the `target`. Properties in source that will overwrite those in target.
+  // Similar to jQuery's `$.extend` method.
+  function merge(target, source, depth) {
+    if (source == null) {
+      return target;
+    } else if (depth >= getSetting("maxDepth", maxPayloadDepth)) {
+      return "[RECURSIVE]";
+    }
+
+    target = target || {};
+    for (var key in source) {
+      if (source.hasOwnProperty(key)) {
+        try {
+          if (source[key].constructor === Object) {
+            target[key] = merge(target[key], source[key], depth + 1 || 1);
+          } else {
+            target[key] = source[key];
+          }
+        } catch (e) {
+          target[key] = source[key];
+        }
+      }
+    }
+
+    return target;
+  }
+
+  // Make a HTTP request with given `url` and `params` object.
+  // For maximum browser compatibility and cross-domain support, requests are
+  // made by creating a temporary JavaScript `Image` object.
+  // Additionally the request can be done via XHR (needed for Chrome apps and extensions)
+  // To set the script to use XHR, you can specify data-notifyhandler attribute in the script tag
+  // Eg. `<script data-notifyhandler="xhr">` - the request defaults to image if attribute is not set
+  function request(url, params) {
+    url += "?" + serialize(params) + "&ct=img&cb=" + new Date().getTime();
+    if (typeof BUGSNAG_TESTING !== "undefined" && self.testRequest) {
+      self.testRequest(url, params);
+    } else {
+      var notifyHandler = getSetting("notifyHandler");
+      if (notifyHandler === "xhr") {
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", url, true);
+        xhr.send();
+      } else {
+        var img = new Image();
+        img.src = url;
+      }
+    }
+  }
+
+  // Extract all `data-*` attributes from a DOM element and return them as an
+  // object. This is used to allow Bugsnag settings to be set via attributes
+  // on the `script` tag, eg. `<script data-apikey="xyz">`.
+  // Similar to jQuery's `$(el).data()` method.
+  function getData(node) {
+    var dataAttrs = {};
+    var dataRegex = /^data\-([\w\-]+)$/;
+
+    // If the node doesn't exist due to being loaded as a commonjs module,
+    // then return an empty object and fallback to self[].
+    if (node) {
+      var attrs = node.attributes;
+      for (var i = 0; i < attrs.length; i++) {
+        var attr = attrs[i];
+        if (dataRegex.test(attr.nodeName)) {
+          var key = attr.nodeName.match(dataRegex)[1];
+          dataAttrs[key] = attr.value || attr.nodeValue;
+        }
+      }
+    }
+
+    return dataAttrs;
+  }
+
+  // Get configuration settings from either `self` (the `Bugsnag` object)
+  // or `data` (the `data-*` attributes).
+  var data;
+  function getSetting(name, fallback) {
+    data = data || getData(thisScript);
+    var setting = self[name] !== undefined ? self[name] : data[name.toLowerCase()];
+    if (setting === "false") {
+      setting = false;
+    }
+    // some settings may need extracting from comma separated strings -> arrays
+    if (name === "notifyReleaseStages" && typeof setting === "string") {
+      setting = setting.split(/\s*,\s*/);
+    }
+    return setting !== undefined ? setting : fallback;
+  }
+
+  // Validate a Bugsnag API key exists and is of the correct format.
+  function validateApiKey(apiKey) {
+    if (!apiKey || !apiKey.match(API_KEY_REGEX)) {
+      log("Invalid API key '" + apiKey + "'");
+      return false;
+    }
+
+    return true;
+  }
+
+  // get breadcrumb specific setting. When autoBreadcrumbs is true, all individual events are defaulted
+  // to true. Otherwise they will all default to false. You can set any event specifically and it will override
+  // the default.
+  function getBreadcrumbSetting(name) {
+    var fallback = getSetting("autoBreadcrumbs", true);
+    return getSetting(name, fallback);
+  }
+
+  // Send an error to Bugsnag.
+  function sendToBugsnag(details, metaData, handledState) {
+    // Validate the configured API key.
+    var apiKey = getSetting("apiKey");
+    if (!validateApiKey(apiKey) || !eventsRemaining) {
+      return;
+    }
+
+    eventsRemaining -= 1;
+
+    // Check if we should notify for this release stage.
+    var releaseStage = getSetting("releaseStage", "production");
+    var notifyReleaseStages = getSetting("notifyReleaseStages");
+    if (notifyReleaseStages) {
+      var shouldNotify = false;
+      for (var i = 0; i < notifyReleaseStages.length; i++) {
+        if (releaseStage === notifyReleaseStages[i]) {
+          shouldNotify = true;
+          break;
+        }
+      }
+
+      if (!shouldNotify) {
+        return;
+      }
+    }
+
+    // Don't send multiple copies of the same error.
+    // This fixes a problem when a client goes into an infinite loop,
+    // and starts wasting all their bandwidth sending messages to bugsnag.
+    var deduplicate = [details.name, details.message, details.stacktrace].join("|");
+    if (deduplicate === previousNotification) {
+      return;
+    } else {
+      previousNotification = deduplicate;
+    }
+
+    var defaultEventMetaData = {
+      device: { time: (new Date()).getTime() }
+    };
+
+    // Build the request payload by combining error information with other data
+    // such as user-agent and locale, `metaData` and settings.
+    var payload = {
+      notifierVersion: NOTIFIER_VERSION,
+
+      apiKey: apiKey,
+      projectRoot: getSetting("projectRoot") || window.location.protocol + "//" + window.location.host,
+      context: getSetting("context") || window.location.pathname,
+      user: getSetting("user"),
+      metaData: merge(merge(defaultEventMetaData, getSetting("metaData")), metaData),
+      releaseStage: releaseStage,
+      appVersion: getSetting("appVersion"),
+
+      url: window.location.href,
+      userAgent: navigator.userAgent,
+      language: navigator.language || navigator.userLanguage,
+
+      severity: details.severity,
+
+      name: details.name,
+      message: details.message,
+      stacktrace: details.stacktrace,
+      file: details.file,
+      lineNumber: details.lineNumber,
+      columnNumber: details.columnNumber,
+      breadcrumbs: breadcrumbs,
+      payloadVersion: "3"
+    };
+
+    // did the user set severity?
+    var userSeverity = details.severity;
+    var userSpecifiedSeverity = userSeverity && userSeverity !== handledState.originalSeverity;
+
+    // annotate this property so that we can check if the "beforeNotify" callbacks changed it
+    // can't annotate a string literal ""/'', so create a String() object, woo!
+    if (userSpecifiedSeverity) {
+      payload.severity = new String(userSpecifiedSeverity);
+      payload.severity.__userSpecifiedSeverity = true;
+    }
+
+    // Run any `beforeNotify` function
+    var beforeNotify = self.beforeNotify;
+    if (typeof(beforeNotify) === "function") {
+      var retVal = beforeNotify(payload, payload.metaData);
+      if (retVal === false) {
+        return;
+      }
+    }
+
+    // did any of the the callbacks set the severity?
+    var callbackSeverity = payload.severity;
+    var callbackSetSeverity = callbackSeverity && !callbackSeverity.__userSpecifiedSeverity && callbackSeverity !== handledState.originalSeverity;
+
+    if (callbackSetSeverity) {
+      // callbacks set a valid severity value
+      payload.severity = callbackSeverity;
+      payload.severityReason = { type: "userCallbackSetSeverity" };
+    } else if (userSpecifiedSeverity) {
+      // user specified a valid severity value
+      payload.severity = userSeverity;
+      payload.severityReason = { type: "userSpecifiedSeverity" };
+    } else {
+      // user did not specify severity, or specified and invalid value
+      payload.severity = handledState.originalSeverity;
+      payload.severityReason = handledState.severityReason;
+    }
+
+    // finally, add whether the error was unhandled so that callbacks can't fiddle with it
+    payload.unhandled = handledState.unhandled;
+
+    if (payload.lineNumber === 0 && (/Script error\.?/).test(payload.message)) {
+      return log("Ignoring cross-domain or eval script error. See https://docs.bugsnag.com/platforms/browsers/faq/#3-cross-origin-script-errors");
+    }
+
+    // Make the HTTP request
+    request(getSetting("endpoint") || DEFAULT_NOTIFIER_ENDPOINT, payload);
+  }
+
+  // Generate a browser stacktrace (or approximation) from the current stack.
+  // This is used to add a stacktrace to `Bugsnag.notify` calls, and to add a
+  // stacktrace approximation where we can't get one from an exception.
+  function generateStacktrace() {
+    var generated, stacktrace;
+    var MAX_FAKE_STACK_SIZE = 10;
+    var ANONYMOUS_FUNCTION_PLACEHOLDER = "[anonymous]";
+
+    // Try to generate a real stacktrace (most browsers, except IE9 and below).
+    try {
+      throw new Error("");
+    } catch (exception) {
+      generated = "<generated>\n";
+      stacktrace = stacktraceFromException(exception);
+    }
+
+    // Otherwise, build a fake stacktrace from the list of method names by
+    // looping through the list of functions that called this one (and skip
+    // whoever called us).
+    if (!stacktrace) {
+      generated = "<generated-ie>\n";
+      var functionStack = [];
+      try {
+        var curr = arguments.callee.caller.caller;
+        while (curr && functionStack.length < MAX_FAKE_STACK_SIZE) {
+          var fn = FUNCTION_REGEX.test(curr.toString()) ? RegExp.$1 || ANONYMOUS_FUNCTION_PLACEHOLDER : ANONYMOUS_FUNCTION_PLACEHOLDER;
+          functionStack.push(fn);
+          curr = curr.caller;
+        }
+      } catch (e) {
+        log(e);
+      }
+      stacktrace = functionStack.join("\n");
+    }
+
+    // Tell the backend to ignore the first two lines in the stack-trace.
+    // generateStacktrace() + window.onerror,
+    // generateStacktrace() + notify,
+    // generateStacktrace() + notifyException
+    return generated + stacktrace;
+  }
+
+  // Get the stacktrace string from an exception
+  function stacktraceFromException(exception) {
+    return exception.stack || exception.backtrace || exception.stacktrace;
+  }
+
+  // Convert a DOM element into a string suitable for passing to Bugsnag.
+  function targetToString(target) {
+    if (target) {
+      var attrs = target.attributes;
+
+      if (attrs) {
+        var ret = "<" + target.nodeName.toLowerCase();
+        for (var i = 0; i < attrs.length; i++) {
+          if (attrs[i].value && attrs[i].value.toString() !== "null") {
+            ret += " " + attrs[i].name + "=\"" + attrs[i].value + "\"";
+          }
+        }
+        return ret + ">";
+      } else {
+         // e.g. #document
+        return target.nodeName;
+      }
+    }
+  }
+
+  // If we've notified bugsnag of an exception in wrap, we don't want to
+  // re-notify when it hits window.onerror after we re-throw it.
+  function ignoreNextOnError() {
+    ignoreOnError += 1;
+    window.setTimeout(function () {
+      ignoreOnError -= 1;
+    });
+  }
+
+  // Disable catching on IE < 10 as it destroys stack-traces from generateStackTrace()
+  if (!window.atob) {
+    shouldCatch = false;
+
+  // Disable catching on browsers that support HTML5 ErrorEvents properly.
+  // This lets debug on unhandled exceptions work.
+  } else if (window.ErrorEvent) {
+    try {
+      if (new window.ErrorEvent("test").colno === 0) {
+        shouldCatch = false;
+      }
+    } catch(e){ /* No action needed */ }
+  }
+
+
+  //
+  // ### Polyfilling
+  //
+
+  // Add a polyFill to an object
+  function polyFill(obj, name, makeReplacement) {
+    var original = obj[name];
+    var replacement = makeReplacement(original);
+    obj[name] = replacement;
+
+    if (typeof BUGSNAG_TESTING !== "undefined" && window.undo) {
+      window.undo.push(function () {
+        obj[name] = original;
+      });
+    }
+  }
+
+  if (getSetting("autoNotify", true)) {
+    //
+    // ### Automatic error notification
+    //
+    // Attach to `window.onerror` events and notify Bugsnag when they happen.
+    // These are mostly js compile/parse errors, but on some browsers all
+    // "uncaught" exceptions will fire this event.
+    //
+    polyFill(window, "onerror", function (_super) {
+      // Keep a reference to any existing `window.onerror` handler
+      if (typeof BUGSNAG_TESTING !== "undefined") {
+        self._onerror = _super;
+      }
+
+      return function bugsnag(message, url, lineNo, charNo, exception) {
+        var shouldNotify = getSetting("autoNotify", true);
+        var metaData = {};
+
+        // IE 6+ support.
+        if (!charNo && window.event) {
+          charNo = window.event.errorCharacter;
+        }
+
+        addScriptToMetaData(metaData);
+        lastScript = null;
+
+        if (shouldNotify && !ignoreOnError) {
+          var name, msg;
+          if (arguments.length === 1) {
+            // if called with a single argument, "message" is likely an Event object
+            // as documented here: https://developer.mozilla.org/en/docs/Web/API/GlobalEventHandlers/onerror#Syntax
+            name = message && message.type ? ("Event: " + message.type) : "window.onerror";
+            msg = message && message.detail ? message.detail : undefined;
+            metaData.event = message;
+          } else {
+            name = exception && exception.name || "window.onerror";
+            msg = message;
+          }
+          sendToBugsnag({
+            name: name,
+            message: msg,
+            file: url,
+            lineNumber: lineNo,
+            columnNumber: charNo,
+            stacktrace: (exception && stacktraceFromException(exception)) || generateStacktrace()
+          }, metaData, {
+            originalSeverity: "error",
+            unhandled: true,
+            severityReason: { type: "unhandledException" }
+          });
+
+          // add the error to the breadcrumbs
+          if (getBreadcrumbSetting("autoBreadcrumbsErrors")) {
+            self.leaveBreadcrumb({
+              type: "error",
+              name: name,
+              metaData: {
+                severity: "error",
+                file: url,
+                message: msg,
+                line: lineNo
+              }
+            });
+          }
+        }
+
+        if (typeof BUGSNAG_TESTING !== "undefined") {
+          _super = self._onerror;
+        }
+
+        // Fire the existing `window.onerror` handler, if one exists
+        if (_super) {
+          _super(message, url, lineNo, charNo, exception);
+        }
+      };
+    });
+
+    var hijackTimeFunc = function (_super) {
+      // Note, we don't do `_super.call` because that doesn't work on IE 8,
+      // luckily this is implicitly window so it just works everywhere.
+      //
+      // setTimout in all browsers except IE <9 allows additional parameters
+      // to be passed, so in order to support these without resorting to call/apply
+      // we need an extra layer of wrapping.
+      return function (f, t) {
+        if (typeof f === "function") {
+          f = wrap(f);
+          var args = Array.prototype.slice.call(arguments, 2);
+          return _super(function () {
+            f.apply(this, args);
+          }, t);
+        } else {
+          return _super(f, t);
+        }
+      };
+    };
+
+    polyFill(window, "setTimeout", hijackTimeFunc);
+    polyFill(window, "setInterval", hijackTimeFunc);
+
+    if (window.requestAnimationFrame) {
+      polyFill(window, "requestAnimationFrame", function (_super) {
+        return function (callback) {
+          return _super(wrap(callback));
+        };
+      });
+    }
+
+    if (window.setImmediate) {
+      polyFill(window, "setImmediate", function (_super) {
+        return function () {
+          var args = Array.prototype.slice.call(arguments);
+          args[0] = wrap(args[0]);
+          return _super.apply(this, args);
+        };
+      });
+    }
+
+    if ("onunhandledrejection" in window) {
+      // browsers with promise support have `addEventListener`
+      window.addEventListener("unhandledrejection", function (event) {
+        if (getSetting("notifyUnhandledRejections", false)) {
+          var err = event.reason;
+          if (!err) {
+            err = {};
+          }
+          var metaData = {};
+          addScriptToMetaData(metaData);
+          if (!err.message) {
+            metaData.promiseRejectionValue = err;
+          }
+          sendToBugsnag({
+            name: err.name ? err.name : "UnhandledRejection",
+            message: err.message ? err.message : "",
+            stacktrace: stacktraceFromException(err) || generateStacktrace(),
+            file: err.fileName || err.sourceURL,
+            lineNumber: err.lineNumber || err.line,
+            columnNumber: err.columnNumber ? err.columnNumber + 1 : undefined
+          }, metaData, {
+            originalSeverity: "error",
+            unhandled: true,
+            severityReason: { type: "unhandledPromiseRejection" }
+          });
+        }
+      });
+    }
+
+    // EventTarget is all that's required in modern chrome/opera
+    // EventTarget + Window + ModalWindow is all that's required in modern FF (there are a few Moz prefixed ones that we're ignoring)
+    // The rest is a collection of stuff for Safari and IE 11. (Again ignoring a few MS and WebKit prefixed things)
+    "EventTarget Window Node ApplicationCache AudioTrackList ChannelMergerNode CryptoOperation EventSource FileReader HTMLUnknownElement IDBDatabase IDBRequest IDBTransaction KeyOperation MediaController MessagePort ModalWindow Notification SVGElementInstance Screen TextTrack TextTrackCue TextTrackList WebSocket WebSocketWorker Worker XMLHttpRequest XMLHttpRequestEventTarget XMLHttpRequestUpload".replace(/\w+/g, function (global) {
+      var prototype = window[global] && window[global].prototype;
+      if (prototype && prototype.hasOwnProperty && prototype.hasOwnProperty("addEventListener")) {
+        polyFill(prototype, "addEventListener", function (_super) {
+          return function (e, f, capture, secure) {
+            // HTML lets event-handlers be objects with a handlEvent function,
+            // we need to change f.handleEvent here, as self.wrap will ignore f.
+            try {
+              if (f && f.handleEvent) {
+                f.handleEvent = wrap(f.handleEvent);
+              }
+            } catch (err) {
+              // When selenium is installed, we sometimes get 'Permission denied to access property "handleEvent"'
+              // Because this catch is around Bugsnag library code, it won't catch any user errors
+              log(err);
+            }
+            return _super.call(this, e, wrap(f), capture, secure);
+          };
+        });
+
+        // We also need to hack removeEventListener so that you can remove any
+        // event listeners.
+        polyFill(prototype, "removeEventListener", function (_super) {
+          return function (e, f, capture, secure) {
+            _super.call(this, e, f, capture, secure);
+            return _super.call(this, e, wrap(f), capture, secure);
+          };
+        });
+      }
+    });
+  }
+
+  // setup auto breadcrumb tracking
+  setupClickBreadcrumbs();
+  setupConsoleBreadcrumbs();
+  setupNavigationBreadcrumbs();
+
+  // Leave the initial breadcrumb
+  if (getSetting("autoBreadcrumbs", true)) {
+    self.leaveBreadcrumb({ type: "navigation", name: "Bugsnag Loaded" });
+  }
+
+  window.Bugsnag = self;
+  // If people are using a javascript loader, we should integrate with it.
+  // We don't want to defer instrumenting their code with callbacks however,
+  // so we slightly abuse the intent and continue with our plan of polyfilling
+  // the browser whether or not they ever actually require the module.
+  // This has the nice side-effect of continuing to work when people are using
+  // AMD but loading Bugsnag via a CDN.
+  // It has the not-so-nice side-effect of polluting the global namespace, but
+  // you can easily call Bugsnag.noConflict() to fix that.
+  if (typeof define === "function" && define.amd) {
+    // AMD
+    define([], function () {
+      return self;
+    });
+  } else if (typeof module === "object" && typeof module.exports === "object") {
+    // CommonJS/Browserify
+    module.exports = self;
+  }
+})(window, window.Bugsnag);
+”ò¿ŸÇ  r       ¯2áâ      window     fndd      old    ¡§\l      self   ˚"·b
+      lastScript     ?.yî      previousNotification   .X«      shouldCatch    ∑†GR      ignoreOnError      ™•ÖÂ      breadcrumbs    Œÿˆ›      breadcrumbHardLimit	    6≤mÌ      placeholderErrorName
+   ËqS      BugsnagNotify      l°©-      eventsRemaining    "0      maxPayloadDepth    T^…      breadcrumbLimit    <®
+      noConflict     ∏‡SZ      Bugsnag    ﬁÀ†»      refresh    º v      notifyException    €ŒÅ_	      exception      Y$Ìt      metaData   hµ…      severity   Z5“6      Bugsnag.notifyException() was called with no arguments     =X˚      log    ún∏      notify     ˝`˚^      addScriptToMetaData    B°-      sendToBugsnag      Ñàö      description    *™kn
+      stacktrace     ]îŸß      stacktraceFromException           generateStacktrace!     …«=      file"   NlÕç	      sourceURL#      Ï¡       originalSeverity$   ÁK Ì      warning%    ÂMW	      unhandled&       MÅÚ      severityReason'     È∞Z#      handledException(    IØm-      Bugsnag.notify() was called with no arguments)      0+QA      location*   Ö»àx      handledError+   –•vV      leaveBreadcrumb,    =∫s¿      DEFAULT_TYPE-   MÌÑ      manual.     äíQ4      crumb/      }hDp      Manual0     uÙ.      getTime1    ¬”Ûq      merge2      Œ-ùL      expecting 1st argument to leaveBreadcrumb to be a 'string' or 'object', got 3   öÇ+2      VALID_TYPES4    ˛tuW      error5      th
+      navigation6     8Jó      process7    l(      request8    ÈÜƒª      user9   æ†W	      validType:      f·Ê#      Converted invalid breadcrumb type ';    ÌTˆí      ' to '<     J+íÓ	      lastCrumb=      ÿÖ Ã      slice>      _nfU      breadcrumbsAreEqual?    €U ≥      min@    •v œ      truncateA   Ñu2      pushB   ög⁄      truncateDeepC   ˇoô      crumb1D     ‘∞»æ      crumb2E     êI‡      isEqualF    —Íc      wrapG   ˜      _superH     í}st      bugsnagI    £)ƒ      currentScriptJ      >‡]ï      getCurrentScriptK   eq 
+      getSettingL     ‹ç‘
+      autoNotifyM     äîÒH      unhandledExceptionN     5>ÖØ      ignoreNextOnErrorO      t¥NŒ      retP    }®@Ò      _hasAddEventListenerQ    rO      addEventListenerR   Ù	[~      setupClickBreadcrumbsS      Ë€˘      callbackT   II∑P      eventU      z6      getBreadcrumbSettingV   r—“Ô      autoBreadcrumbsClicksW      	Yπ#
+      targetTextX     ñh      targetSelectorY     Ò˜˝r      nodeTextZ   $≥›L	      nodeLabel[      ÔÀ√      [hidden]\   -y
+,      Cross domain error when tracking click event. See https://docs.bugsnag.com/platforms/browsers/faq/#3-cross-origin-script-errors]    ŸÒ˛ø      UI click^   ü™‚X      click_      ˙Îb      enableAutoBreadcrumbsConsole`   zÀ¨h      disableAutoBreadcrumbsConsolea      !T	ƒ      setupConsoleBreadcrumbsb    è`<      trackLogc   ‹Ÿú…      argsd   ÿÉ¨i      autoBreadcrumbsConsolee     O◊¨*      Console outputf     ˆ^v      , g     ˛Q1      consoleh    y≥d	      nativeLogi      Á$É
+      nativeWarnj     ëMÜ      warnk   Õ.õ~      nativeErrorl    ãªm”      nativeGroupm    ÎH™y      nativeGroupCollapsedn   ©Û0ü      groupCollapsedo     )é+Ê      enhancep    y^?      [group]q    ¶¢Ç      concatr     ¯Ü5Ü      enableAutoBreadcrumbsNavigations    Ex       disableAutoBreadcrumbsNavigationt   ªæ       setupNavigationBreadcrumbsu     K∫ 0	      parseHashv      mçûÆ      buildHashChangew    ‡y]∏      oldURLx     ¥~€y      newURLy     yá¥n      hashz   ∆˛t∞      Hash changed{   =2∑´      buildPopState|      ätó’      Navigated back}     ¯¸˛      buildPageHide~      ¡í¨      Page hidden    òì!      buildPageShowÄ      ≠(∑^
+      Page shownÅ     VE#	      buildLoadÇ      	’À◊      Page loadedÉ    GòÃ      buildDOMContentLoadedÑ      KjH      DOMContentLoadedÖ    °"/      buildStateChangeÜ   “E      titleá      ÒîBJ      currentPathà    –®4O      pathnameâ   O}k      History ä   7À$?	      prevStateã      ˇjh      historyå    #¥=]	      nextStateç      +G	      buildPushStateé     –∆Í8	      pushStateè      Û”}è      buildReplaceStateê      úN-è      replaceStateë   ˙F·f      wrapBuilderí    JwMz      autoBreadcrumbsNavigationì      ‡Õ      bindî   Rz‹*      nativePushStateï    ⁄Lª’      nativeReplaceStateñ     í„Î
+      hashchangeó     Ÿm)      popstateò   T(∆„      pagehideô   Ë}2      pageshowö   2áU)      loadõ   ôM€€      enableAutoBreadcrumbsErrorsú    œ∆5˜      autoBreadcrumbsErrorsù      Èxw       disableAutoBreadcrumbsErrorsû   ÀI◊      enableAutoBreadcrumbsClicksü    ı÷_      disableAutoBreadcrumbsClicks†   =ß      enableAutoBreadcrumbs°      ˘Õ⁄É      disableAutoBreadcrumbs¢     #–P∫      enableNotifyUnhandledRejections£    ~fÒF      notifyUnhandledRejections§      ’∆Y¥       disableNotifyUnhandledRejections•   Tb      synchronousScriptsRunning¶      ∏OÄ      documentß   πUüï
+      readyState®     Dï»á      complete©   =&tÖ      loadCompleted™      VıZ/      attachEvent´    áƒ{p      onload¨     XFZ      getElementsByTagName≠   ú∑»õ      srcÆ    4W»      contentØ    ¿%?¸      inlineScript∞   Q√:	      innerHTML±      ÂîyD      API_KEY_REGEX≤      jJç      ^[0-9a-f]{32}$≥     ùKÊ:      FUNCTION_REGEX¥     ˆ‘Ω      function\s*([\w\-$]+)?\s*\(µ    mŸÎL      DEFAULT_BASE_ENDPOINT∂      cÌ      https://notify.bugsnag.com/∑    6˙       DEFAULT_NOTIFIER_ENDPOINT∏      ÿh¸ù      NOTIFIER_VERSIONπ   ÿ†u      3.3.2∫      yDıﬂ
+      thisScriptª     …⁄É      propertyº   cí3‹      newFunctionΩ    ö¯f      oldFunctionæ    ˇ?Xã      msgø    #¯uÙ
+      disableLog¿     Â`ZJ
+      [Bugsnag] ¡     ¶b®      obj1¬   Ìâ*
+      obj2√   Á¨£	      serializeƒ      à3¿µ      text≈   b»≈e      textContent∆    ≠	év	      innerText«      dÙ∂      submit»     ˙U~      button…     BlªH	      ^\s+|\s+$       !”T˜      partsÀ      ﬁﬁÿ      tagNameÃ    6CY>	      classNameÕ      ˝POÄ      classStringŒ    #•ç      querySelectorAllœ   ⁄Eú¡      indexOf–    •_œ”
+      parentNode—     ≥ÜBa
+      childNodes“     Hˇ≤‚      :nth-child(”    éÉ–ù       > ‘    Ä:„      OMISSION’   ÒRöà      (...)÷      ¢]¡Ï      isArray◊    6Òë      argÿ    \<Ê      depthŸ      W	¬c      newDepth⁄   e∂´P      setting€    ‚Äo      maxDepth‹   ¿)'      [RECURSIVE]›    Ù«≈Ü      newArrayﬁ   7Éj	      newObjectﬂ      B¸ø;      key‡    ﬂN#9      obj·    ›2†      prefix‚     FΩô      =[RECURSIVE]„   â¢°      Node‰   ê˘LÇ      targetToStringÂ     Ñ6¶1      strÊ    Ü}ÿ„      sortÁ   K÷Ωê
+      _serializeË     ÀÀ&<      paramsÈ     ë=>µ      &ct=img&cb=Í    Û%˛      BUGSNAG_TESTINGÎ    \5=      testRequestÏ    e`CÆ      notifyHandlerÌ      ﬁä1      xhrÓ    ⁄$€      XMLHttpRequestÔ     óx5      open   ≈ô¸
+      GETÒ    ¸,∏      sendÚ   e ú      imgÛ    û“      ImageÙ      “œü      getDataı    &`°›      nodeˆ   ¬à0N	      dataAttrs˜      çœ<	      dataRegex¯      Ì>œ      ^data\-([\w\-]+)$˘      ˘Ôe˚      attrs˙      „å5∆
+      attributes˚     A¢Ωê      attr¸   U5_      nodeName˝   ©Èç¿	      nodeValue˛      6ó(Å      dataˇ   Ë˜J◊      fallback   RâDo      toLowerCase   ÷‡)<      notifyReleaseStages   ¬{…9      \s*,\s*   f=·      validateApiKey    S∞◊ü      apiKey    ÒÏâú      Invalid API key '     (’Û>      autoBreadcrumbs   ∂ú’c      details   TYk‘      handledState	  õD˝      releaseStage
+  zû
+      production    ®r8z      shouldNotify  6*`      deduplicate   ‘¯õ›      defaultEventMetaData  K#åî      device    Ä%]¸      time  v÷ı      payload   ∑Î=      notifierVersion   ’Ì      projectRoot   s4Í      protocol  ﬁ†∫™      //    	ﬁ(r      host  π©±”      context   Bøı'
+      appVersion    ª©`X      href  ìãà	      userAgent     π„+	      navigator     Tú u      userLanguage  ≥>ÿy      payloadVersion    ‰¥Ë‚      userSeverity  Û˜      userSpecifiedSeverity     Wéæ      __userSpecifiedSeverity    G•Ë      beforeNotify!  ÁÑ≈û      retVal"    ≠nxj      callbackSeverity#  I≈4      callbackSetSeverity$   ûx\æ      userCallbackSetSeverity%   +‡ﬂv      Script error\.?&   {óﬁe}      Ignoring cross-domain or eval script error. See https://docs.bugsnag.com/platforms/browsers/faq/#3-cross-origin-script-errors'     mµ9      endpoint(  W;≈±	      generated)     µ5a      MAX_FAKE_STACK_SIZE*   ó∏p      ANONYMOUS_FUNCTION_PLACEHOLDER+    ‚Ì      [anonymous],   ‘ø–      <generated>
+-  CÔnß      <generated-ie>
+.   Qâ1      functionStack/     Œ∆Ò      curr0  ÄÃ]	      backtrace1     Ù<E      ="2    3AtŸ
+      setTimeout3    wµ`Ç      atob4  UsÓö
+      ErrorEvent5    D∆_«      colno6     =}Á–      polyFill7  ∑T:u      makeReplacement8   Õ_      original9  ï6À\      replacement:   ,´Æ(      undo;  ¢Î˜s      onerror<   	5 ï      _onerror=  í]ß      lineNo>    ¿QUø      charNo?    JJ      errorCharacter@    ~r‡°      Event: A   Â~ö™      window.onerrorB    (tS®      detailC    #• §      hijackTimeFuncD    Ïà       setIntervalE   ∑ä¨R      requestAnimationFrameF     ¢›#      setImmediateG  UFv      onunhandledrejectionH  Âwc2      unhandledrejectionI    ºoò      errJ   ¸+=      promiseRejectionValueK     ®m!√      UnhandledRejectionL    8ÎÍ‘      unhandledPromiseRejectionM     å1óâ     EventTarget Window Node ApplicationCache AudioTrackList ChannelMergerNode CryptoOperation EventSource FileReader HTMLUnknownElement IDBDatabase IDBRequest IDBTransaction KeyOperation MediaController MessagePort ModalWindow Notification SVGElementInstance Screen TextTrack TextTrackCue TextTrackList WebSocket WebSocketWorker Worker XMLHttpRequest XMLHttpRequestEventTarget XMLHttpRequestUploadN     Ñ„£t      \w+O   ∑dC&      captureP   5 \r      secureQ    PA1(      handleEventR   ]¸ç      removeEventListenerS   ´{e      Bugsnag LoadedT    ˝Ìu      defineU    ◊®ÑX      amdV   ,∆Ë      exportsW   ∑?vËÒ      Bugsnag.notifyException() was called with a string. Expected instance of Error. To send a custom message instantiate a new Error or use Bugsnag.notify('<string>'). see https://docs.bugsnag.com/platforms/browsers/#reporting-handled-exceptionsX     ¶RèÈ      self.noConflictY   LùÀù      self.refreshZ  ]≠:®      self.notifyException[  gƒ8S      self.notify\   &«æB      self.leaveBreadcrumb]  t9«ù      wrap/_super.bugsnag_   ≠üΩI!      self.enableAutoBreadcrumbsConsole`     ÔôWñ"      self.disableAutoBreadcrumbsConsoleb    ^C.9      setupConsoleBreadcrumbs/self.enableAutoBreadcrumbsConsolec     “S ÿ;      setupConsoleBreadcrumbs/self.enableAutoBreadcrumbsConsole/<d   æ‘†:      setupConsoleBreadcrumbs/self.disableAutoBreadcrumbsConsolee    ê
+$      self.enableAutoBreadcrumbsNavigationf  #ì‘
+%      self.disableAutoBreadcrumbsNavigationr     ∂˛Ô¢(      setupNavigationBreadcrumbs/wrapBuilder/<s  g¿F?      setupNavigationBreadcrumbs/self.enableAutoBreadcrumbsNavigationt   cDr@      setupNavigationBreadcrumbs/self.disableAutoBreadcrumbsNavigationu  ß.)(       self.enableAutoBreadcrumbsErrorsv  L1ò!      self.disableAutoBreadcrumbsErrorsw     ∆⁄       self.enableAutoBreadcrumbsClicksx  ˘+∆!      self.disableAutoBreadcrumbsClicksy     8‘πÜ      self.enableAutoBreadcrumbsz    ˝+.˘      self.disableAutoBreadcrumbs{   ƒ˘í<$      self.enableNotifyUnhandledRejections|  ŸJ≠%      self.disableNotifyUnhandledRejections}     …md8      enhance/object[property]~  ÄØS      ignoreNextOnError/<   ÿR˛»
+      polyFill/<Ä    ›&.*      hijackTimeFunc/<Å  ˝§éa      hijackTimeFunc/</<     [   E  f   [          1   Ô%,â                           /                                                     	                                                  
+                                                       
+                 
+                                                                                                      
+                        	                                                                                                                                            !                 "                 #                $                 %                 &                 '                 0                 1                 2                3      %           4                 5                 6                 7                 8      *                           9                 :                 ;                 <      /                           =      1                           >                 ?                 @                 A                 B                 C                 D      9                9                           E                 F                 G      >           H                I      @           J                                                                                                                                                                          (                 )                 *                 +                 ,                 -                 .                 /                                K      T                U           L                M      W          N      X           O                P      Z           Q                R      \           S                 T                 U      _          V      `           W      a                _          X      c           Y                 Z      ≥Oåc            4               P  PP  P©    PF  P√  PU  P@  P	  P6 PÜ  o  P≥  PC E  PR    Pt    P∏  PJ  P   PB  P  P  PZ  PÙ  P  Pa  ∫  P•  P˛  P7  PY  P P  P∑  P  P‰  PN  P  P  Pµ  ÷  P1  P  P>  P  PK  P±  P  P             C  D               G  PI  P                O  	   q            e           e                S              T  W  X           e                 b  Ph  Pi  Pk  Pl  Pm  P               c                                	                 	                 	                 	                 	                                 u  Pv  {  }    Å  É  Ö  Pç  Pè  Pë  Pî  Pï  P             ‡              T  w  x                                                                                                .  †  Ü  ‡  á               †  Ü  ‡               †  Ü  ‡               *  `              	                                                                 Ö  Ü                Ö                 ª  º  PΩ  P              	   q               æ  ø  g               ¡  ¬              ï ƒ              ï    Õ    ‹            e              Ê    ‘               ◊  	                ÿ  Ÿ  ⁄  ›  i  ﬁ  ﬂ              ‡  ·  ÿ  €  Â  p  k  v           e              ≠  ò  ÿ  ﬂ           e              ‡  Ë  Ï  Ì  Ú              ı  ˆ  ˜  ˘  i  ˚  ﬂ              .  ˇ  ⁄                            .  ˇ                   	   i         ! " #               (   ) * . / ◊ 	      	           	      e                             ≠  ˘  O  i                                              ‡  P. `7 8 P9                                                               .        	                .        	            Ê    ,  .  3  9  i  <                                                                                                                                                                                                             e               G  P          H  
+              ‡  = >      .  æ  	                G  P            f `t  c  P	                 q                G  P             S               G  P              c  	   q               T  I               ¡   j               G  P            e  f  O P q            I              G  P            e  f  O P q                   Ø¬0∞≤     ¥     …     ¯           %     N    IÙ$KEÆ˙ö                .      !  
+  B          #  %  &        «          «  .       
+   W  X         «  .       
+                     «  .       
+   «  .     
+    «  .     
+    «  .     
+    «  .     
+    «  .         «  .          •   X ä  å     
+      ≠  Æ                                               d         8    	  ‡       .      !  
+  B               «          «                     #   .      !  
+  B           #  %  &        «          .      !  
+           #  %  &        «          «  .  ≤     
+   .                            .    !  
+  B            #  %  &        «          «  .            !    	                         .      !  
+  B          #  %  &        «     
+     «  .  á&’™ç!´![   L     £#ïFL                             j    ¥   ¥   H   t ÿ°@ `PFÄ \/P4P 	  »}çz¯  Ñ               f      $∂  «   ÿ∂ «   ÿj   « *  ÿj   «   ÿj   ∆  ÿj   ∆  ÿj   ∆  ÿj   ∆   ÿj   «   ÿj   «   ÿj	   «   ÿj
+   « %  ÿj   «   ÿj   «   ÿj   «   ÿj   « 	  ÿj   « '  ÿj   «   ÿj   «   ÿj   « (  ÿj   «   ÿj   «   ÿj   « ,  ÿj   «   ÿj   «   ÿj   « )  ÿj   «   ÿj   « "  ÿj   « #  ÿj   « $  ÿj   «   ÿ7   « &  ÿ«    ÿ«   ÿe    « +  ÿ(«   ÿ   « 
+  ÿ
+«   ÿ« .  ÿ∫ &  J    ÿ∫ &  j!   J"   ÿ∫ &  j#   J$   ÿ∫ &  j%   J&   ÿ∫ &  j'   J(   ÿ∫ &  j)   J*   ÿ∫   H+   ,   «   ÿ∫ &  j-   J.   ÿ∫ &  j/   J0   ÿ∫ &  j1   J2   ÿ∫ &  j3   J4   ÿ∫ &  j5   J6   ÿ∫ &  j7   J8   ÿ∫ &  j9   J:   ÿ∫ &  j;   J<   ÿ∫ &  j=   J>   ÿ∫ &  j?   J@   ÿ∫ &  jA   JB   ÿ∫ &  jC   JD   ÿ¥E   HF   G   «   ÿ¥E   H+   ñC   ì   ¥E   ⁄H+   ›H   ∑   t ÿ∫   ⁄H+   ›I   ∑   t ÿï#   ì"   ∫   ⁄HJ   ›K   ∑   t ÿì$   iL   « -  ÿiM   «   ÿN   ∆  ÿ∑  O   %« !  ÿP   «   ÿ¥E   ⁄HQ   ›R   p ∆  ÿ∑  ∑  HS   &I«   ÿ∫ &  ∫   JT   ÿ∫   HU   ó   ì.   «    ÿïl   ì.   ∫   HV   ñX   ì0   ¶∫   HV   }W   ‹  ~ HX   ñ   ì5   «    ÿì5   ï   ì5    †®™´  ÿ´  ÿÀì5   ∫ ,   Z   p ñ  ì7   ∫    ∫   [   j\   t ÿj]   ∆  ÿ∫    ∫   ^   ∑  t ÿ∫    ∫   _   ∑  t ÿ∫   H`   ñ#   ì<   ∫    ∫   `   ja   t ÿì=   ∫   Hb   ñ#   ì?   ∫    ∫   b   jc   t ÿì@   d   ∫   !ñ$   ìB   ∫   ⁄H+   ›e   jf   t ÿìD   g   ⁄Hh   ›ii   jj   t ÿìF   ∑   t  ÿ∑   t  ÿ∑   t  ÿ∫ ,   kµ{JÑ   p ñ3   ìK   ∫ &  ⁄H*   ›7l   m   :n   o   :p   t ÿìP   ∫   ∫ &  Jq   ÿ¥r   s   ò   ìU   ÿ¥r   Ht   ìW   ñ#   ìX   ¥r    e    ju   t ÿïQ   ì[   ¥v   w   ò   ì_   ÿ¥v   Hx   w   ìc   ñ   ìd   ¥v   ∫ &  Jx   ÿìf   °ˇˇœ0 `PK `P7 `P7 `P; `P8 `PK `PH `PH `PM `Pê@0 `Pê@G `Pê@v `Pê@Ä  ò `Pê@Ä  `Pó@Ä B `Pê0 `Pê@Ä ã `Pê0 `Pê@Ä  `Pê0000 `Pê0000 `Pê0000 `Pê0000 `Pê@Ä . `Pê@Ä 5 `Pê0000 `Pê@Ä D "`Pñ@Ä O `Pî0 `Pñ 	P4 `Pñ P>0 `Pï PIÄ q `P; `P;00 `P: "`Pê0 `P;000 `Pë 	P8 `Pñ@Ä + `Pê@Ä {@Ä _ `Pî0 `Pë0000 `Pî01 
+`P®0 `Pô00 ë@Ä ~ `P,
+PMÄ Ü `Pï PDÄ À `PJÄ ﬂ `Pî P4 `Pî P40 `Pî0 `Pï PIÄ Í `Pî0 `Pï PIÄ Ù `Pï00 `Pñ PIÄ  `Pñ Ä åPIÄ 5 `P9 `P9 `P900 `P,
+P= `Pë **ˇˇˇ⁄P900 `Pê@Ä G `P∞00 `Pê P>00 `Pó †00 `Pï00P   	  	  Y   C     ˇˇˇˇ          9   |   ù$XÃ|   =                          ∫   ∫   J   ÿ∫      ñ   ì   ∫   N   ÿì   ∫ &  û°0 `Pê0 `Pñ0 `Pê@ `P5 Q  4   YÉa~4   	                           
+«   ÿ°0 `P8 P Ù  Ù®“Ù  %        	       5       ’∆  ÿµ  ó=   ì      ∆   ÿ∫ %   ∑   t ÿ∫ &  ⁄H   ›∫ 
+  ∑   t ÿ ûì   µ     ñ5   ì   ∫ %      t ÿ∫ &  H   ⁄H   ›∑  t ÿ ûì   µ ò   ì   ÿµ    ì   ñ   ì   µ ≈ ÿ¥   ≈ ÿì   µ ó   ì   7   ≈ ÿì   ∫    µ t ÿ∫ )   7   µ ô   ì   ÿµ  H	   ì   :	   µ  H
+   ô   ì   ÿµ  H   ì   :
+   ∫ "   µ  p ô   ì   ÿ∫    p  ì   :   µ  H   ô   ì!   ÿµ  H   ì"   :   µ  H   ô   ì%   ÿµ  H   ì&   :   µ  H   ñ   ì)   µ  H   %ï   ì+   ¥   ì,   :   µ :   µ 7      :   :   7      :   :   t ÿ°6 `P= `P: `P*P4 `Pï P4 `PA) F `Pî0 `P6E	 	PD `Pñ P4 `PA) F `P.ô0 `P7 `PN `P= `PN `P)PD `P; †0 •0 )Pî &P= •0 •0 µ0 88 : 6 %O PD) P $  ∆Ö:$  ≤                         µ  ó)   ì   ∫ 
+  ≈  ÿ   ≈ ÿ∫ %   µ t ÿì   ∫ )   7   µ  :   µ :   ∫    p  :   ∫   H   ⁄H   ›p  :   :	   µ :
+   µ 7      :   :   7      :   :   t ÿ°0 `P= `P9 `P9 `P)PI `P; 8 8 &PH ë P8 6 88 : 6 %O PD P    ú  5<ÿÎå  H                H         ∆   ÿ7   ∑   :      :   ¥   }‹  ~  ⁄H   ›p  :   ∆  ÿµ  ⁄	   õ    ì
+   ⁄
+   õ.   ì   ú¢   ì   ∫ (   ∑  µ  p ∆  ÿïû   ì   µ ò   ì   ÿµ 	   ì   ñ6   ì   ∫ (   ∑  7   µ  :   µ :   p ∆  ÿï!   ì   ∑  7   µ  :   J   ÿì   ï    ì   ∫ %      µ  %t ÿ ûì   e   ∑   f       f      f      f      f      f      f      f   ∆  ÿ∆  ÿ∆  ÿî   ∑  ∑  H   ñG   ì   ∑  ∑  I∑  H   ñ   ì"   ∆  ÿï   ì"   ∑  .'∆  ÿï™ˇˇˇì$   ∑  óB   ì%   ∫ %      ∑  H   %   %∑   %   %t ÿ∑  ∑   J   ÿì,   ∫ +  ⁄H   ›ˇp I∆  ÿ∫ *   ∑  ∑  p ñE   ì1   ∑  ∑  H   ô   ì3   ÿì3   J   ÿ∑  ⁄H   .'J   ÿïû   ì8   ¥   ⁄H   ›∫ &  H   ∫   p ∆  ÿ∑  ∫ 	   ∑  H    p J   ÿ∫ +  ⁄H    ›∫    ∑  å p t ÿ∫ +  H   ∑  ñ$   ìE   ∫ +  ⁄H   ›∑  p « +  ÿìH   °0 `PJ `P5 9 : *P*PM
+ `P∞00 `P-P8 `P:0 
+`P.ô0 `P? 
+8 
+H Pí@0 `P)ì@ `P:0 `P+U%ˇˇˇÆP4 `PA9 F `P%)*	*****	? `P6 	 `P&fPò0 
+`Pù0 `P6 `PJ  ,`Pï@& `P> `P¶ P4 `Pì@+ `P.P: `P.P= `P§0 `Pú00 `Põ P8 `Pï P9 `Pô P#ˇˇˇ˚PD5 
+`Pô0 `P, %ˇˇˇ˙PN9 P    ú         ê  [   ¨   34êÃ¨   t                         µ  òj   ì   ÿµ ò\   ì   ÿµ  H   µ H   ò@   ì   ÿµ  H   µ H   ò$   ì
+   ÿ∫    µ  H   µ H   p ì   û°0 `Pú0ú0ú0ñ P8 Q    L  ã†n  Ø   	                   $∂  «   ÿ¶∫      ñ   ì   ∫   ûì   ∫   H   óC   ì   ∫   p  «   ÿ∫   j   J   ÿ∫   H   ∫   H   J   ÿì
+   ∫   H   ûï!   ì    †®™´   ÿ´   ÿ∫   †À°Àì   °91 
+`Pñ0 `PE6 F 
+`Pî0 `P? `Pê@- `Pü@/ `PJ6 N3 ; `PE6 Y   L  <     ï      ˇˇˇˇ    ß                  
+   É   (  ó‚'¿Ù  0               )       9’∆  ÿ◊∆  ÿ∫   «  ÿ∫   ñﬂ  ì   ¶∫   ⁄H   ›∑  ∑  p †ït  ïm  ì    †®™´  ÿ´  ÿ∫,      p ñ4  ì   7   ∆   ÿ∫   ∑   t ÿ∫)   7   ∑  H   :   ∑  H   :   ∫"   ∑  p ô   ì   ÿ∫   p  ì   :   ∑  H	   ô   ì   ÿ∑  H
+   ì   :   ∑  H   ô   ì   ÿ∑  H   ì   :   ∑  H   ñ   ì   ∑  H   %ï   ì   ¥   ì   :   ∑   7      :   :   7      :   :   t ÿ∫$   t  ÿì&   ∑  £Àï   ì&   ©ü †«  ÿ†ñ   ì'   £ï    ì'   ù            ì'   °ì'   ï2   ì'   ∫   ⁄H   ›∑  ∑  p ∆  ÿ«  ÿ∑  ûì)    †°< 
+`PK `P?1 `Pî PC% ó@	 ; `P,
+P= `P: `P*P4 `P; > > *Pî P= ß0 ß0 ∑09 : 6 %O PD `PO `Pí0 4 `P¬@0 `Pî PH" `P7 `PD% X (    ¯  Î     U   Y  ˇˇˇˇ        '   &          '   é  Ä   Å!tÄ   ;                         ∫   ó   ì    ûì   j   ∆   ÿ∫   ⁄H   ›   ∑   t ÿ°0 `P? `PA! F `PJ  `Pñ P4 P  x  ØYX  ”                       $∫       p ó   ì    ûì   ¶∫    µ  H   p ∆   ÿ∫    µ  H   p ∆  ÿï<   ì    †®™´  ÿ´  ÿ   ∆   ÿ   ∆  ÿ∫ %      t ÿÀì   ∫ &  ⁄H   ›7      :	   
+   :   7   ∑   :   ∑  :   :   t ÿ°0 	`P+P= `PA F@1 `P.P8 `P.Pï0 ; `P: `P: `P+PJ `Pë0 : : 5 
+9 
+N PD P x  h     Y   /   ˇˇˇˇ            1   (   ÈÄ¥(                               °     (   ÈÄ¥(                               °     @  hbkä@  À                          j   «   ÿ∫  H      ñ   ì    ûì   ¥   H   «   ÿ¥   H   «   ÿ¥   H   «   ÿ¥   H   «   ÿ¥   H   «   ÿ∫&  j	   J
+   ÿ∫&  j   J   ÿ∫      p ñ   ì   ∫&  ⁄H
+   ›t  ÿì   °K `Põ0 `PAB F `Pê0 `Pê0 `Pê0 `Pê0 `Pê@ `Pê@5 `Pê@? `P+P= `P,PIB P Ë   AX∏&Ë   ã                         ∫      p ó   ì    ûì   ∫&  ⁄H   ›7      :      :   7   µ  :	   ¥
+   H   H   ⁄H   ›µ p ⁄H   ›   p :   :   t ÿ°0 	`P+P= `PA F `Pë0 : : 5 
+8 
+ô P/PM PD P    Ë   ∑Ë   ä                          ∫&  J   ÿ∫   ¥      j   t ÿ∫   ¥      j   t ÿ∫   ¥      j   t ÿ∫   ¥   	   j
+   t ÿ∫   ¥      j   t ÿ°0 `PL `Pï PD `Pï PD `Pï PD `Pï PD `Pï PD P H   ËVØH                           ’∆   ÿ∫       ∑   t ÿ°6 `P/P4 P H   ËVØH                           ’∆   ÿ∫       ∑   t ÿ°6 `P/P4 P H   ËVØH                           ’∆   ÿ∫       ∑   t ÿ°6 `P/P4 P å   5y¬,å   L         	       	        ’∆   ÿ∫       e      f    ⁄H   ›¥   H   H   ⁄H   ›∑   p p t ÿ°6 `Pê ´ )P#ˇˇˇ„P#ˇˇˇÍP4 P   å   5y¬,å   L         	       	        ’∆   ÿ∫       e      f    ⁄H   ›¥   H   H   ⁄H   ›∑   p p t ÿ°6 `Pê ´ )P#ˇˇˇ„P#ˇˇˇÍP4 P   ®   ]í¸ ®   ]                          ∫&  J   ÿ¥   ∫   J   ÿ¥   ∫   J   ÿ¥   ∫   J   ÿ¥   ∫   J   ÿ¥   ∫   J   ÿ°0 `PL `Pê0 `Pê0 `Pê0 `Pê0 `Pê0 P  (   ÈÄ¥(                               °     (   ÈÄ¥(                               °       ¢Ö)x  ;                .        j   «   ÿj   ∆   ÿj   ∆  ÿj   ∆  ÿj   ∆  ÿj   ∆  ÿj   ∆  ÿj   «   ÿj	   «   ÿj
+   «   ÿj   «   ÿ∫  ôl   ì   ÿ∫  H   ôV   ì   ÿ∫  H   H   ô;   ì	   ÿ∫  H   H   ô    ì   ÿ∫  H   H   H   ì   ñ   ì    ûì   ¥   H   «   ÿ¥   H   «   ÿ∫&  j   J   ÿ∫&  j   J   ÿ∫  ⁄H   ›   ∫    ∑   p t ÿ∫  ⁄H   ›   ∫    ∑  p t ÿ∫  ⁄H   ›   ∫    ∑  p t ÿ∫  ⁄H   ›   ∫    ∑  p t ÿ∫  ⁄H   ›   ∫    ∑  p t ÿ∫  ⁄H   ›   ∫    ∑  p t ÿ∫      p ñ   ì,   ∫&  ⁄H   ›t  ÿì.   °Û@_ `Pë0 ñ0 õ0 õ0 §00 `PAÄ  Ü Fi `Pê0 `Pê@m `Pê@u `Pê@| `Põ &P$ˇˇˇ·P4 `Põ $P$ˇˇˇ„P4 `Põ $P$ˇˇˇ„P4 `Põ $P$ˇˇˇ„P4 `Põ  P$ˇˇˇÁP4 `Põ ,P$ˇˇˇ€P40 `P+P= `P,P90 P   \   c‹\   +                         µ  ⁄H   ›   p Iô   ì   ÿ   ì   û°0 `P/Pö0 Q      V—RI   ª                        µ  H   ∆   ÿµ  H   ∆  ÿ7   ∆  ÿ∑   ò   ì   ÿ∑  ì   ñ=   ì   ∑  ∫    ∑   p J   ÿ∑  ∫    ∑  p J   ÿï   ì	   ∑  ¥   H   J   ÿì   7   	   :
+      :   ∑  :   û°0 `P= `P= `PJ 
+`P¢0 `P.P9 `P.Pì00 `Pô@ `P5 : : I Q  P   K¶–P                             7      :      :   û°0 `P5 : J Q    P   K¶–P                             7      :      :   û°0 `P5 : J Q    P   K¶–P                             7      :      :   û°0 `P5 : J Q    P   K¶–P                             7      :      :   û°0 `P5 : J Q    P   K¶–P                             7      :      :   û°0 `P5 : J Q    ‘   ,É|≤‘   ä                        ¥   H   ¥   H   %¥   H   %∆   ÿ7      :      µ  %:	   7
+   ∑   :   µ ô   ì   ÿ∑   ì   :   ¥   H   :   µ :   :   û°0 `P•0 `P5 : > 5 
+9 
+ú0 
+? 
+M Q   H   >yô‚H                            ∫       µ  µ µ p û°0 `Pî P3 Q H   >yô‚H                            ∫       µ  µ µ p û°0 `Pî P3 Q <   í—á9<      	                      ∂  «   ÿj   û°9 `PE Q î   ÖM»î   J                        ’∆   ÿ∫      p ó   ì    ûì   ∫&  ⁄H   ›∫   ⁄H   ›∑   p t ÿ°6 `P+P= 
+`PA F `Pù P#ˇˇˇËP4 P    ú   ∆,Øú   Q                          ∫&  J   ÿ∫   ¥      ∫    ∫   p t ÿ∫   ¥      ∫    ∫   p t ÿ°0 `PL `Põ P#ˇˇˇÈP4 `Põ !P#ˇˇˇÊP4 P  h   {†`∫h   -                          ∫&  J   ÿ¥   ∫   J   ÿ¥   ∫   J   ÿ°0 `PL `Pê0 `Pê0 P    8   ´∆÷Ú8                             ∫ &  J   ÿ°0 `P< P 8   ãQÆ8                             ∫ &  J   ÿ°0 `P< P 8   ´∆÷Ú8                             ∫ &  J   ÿ°0 `P< P 8   ãQÆ8                             ∫ &  J   ÿ°0 `P< P à   ØÖkEà   A                          ∫ &  ⁄H   ›t  ÿ∫ &  ⁄H   ›t  ÿ∫ &  ⁄H   ›t  ÿ∫ &  ⁄H   ›t  ÿ°0 `P,P4 `P,P4 `P,P4 `P,P4 P  à   ØÖkEà   A                          ∫ &  ⁄H   ›t  ÿ∫ &  ⁄H   ›t  ÿ∫ &  ⁄H   ›t  ÿ∫ &  ⁄H   ›t  ÿ°0 `P,P4 `P,P4 `P,P4 `P,P4 P  8   ´∆÷Ú8                             ∫ &  J   ÿ°0 `P< P 8   ãQÆ8                             ∫ &  J   ÿ°0 `P< P 4    ËP54                              «   ÿ°0 `P7 P  ‰   O>eΩ‰   õ                         ¥   H   ô   ì   ÿ∫   ì   ∆   ÿ∑   ò   ì   ÿ∫   ì   ñR   ì   ¥   H   ô   ì	   ÿ¥   ⁄H   ›   p ì   ∆  ÿ∑  ∑  H   &I∆   ÿì   ∑   û°0 `P§@ `P§0 `P¶ P= `Pö@ `P4 Q  º   =pˆ…º   y                 
+       ∫    p  ∆   ÿ∑   ña   ì   µ  7   ∑   H   :   ∫ ,      p ñ   ì   ∑   H   ï   ì      ì   :   J   ÿì
+   °0 `PN `P> `P8 > ,	P∫@	 P   X   EW)¡X   $   	                     ∂ «   ÿµ  µ I«   ÿµ  µ j   Lÿ°9 `P= `PM P    ò   ∫ÿπò   X                        ’∆   ÿ◊∆  ÿ∫   ⁄H   ›∑  ∑   t ÿ∫      ñ"   ì   ∫   ⁄H   ›∑  ∑   t ÿì   °< `Pî P4 
+`Pñ0 `Pî PI P  Ã   Ò’˝„Ã   É                        ∫ ,      p ∆   ÿ∫   H   ∆  ÿ∑  ¥   ò*   ì   ÿ∑  H   ¥   ò   ì	   ÿ∑   ì
+   ñ"   ì   ∑  ⁄H   ›   µ  %t ÿì   °0 `P+
+PH `P? `PØ 6î0 `Pî PI P   L   :(L                            ∫    µ  p ∫    µ p û°0 `P)P,P4 Q ¯   ƒjÃÙ¯   ¨                        µ  H   ô#   ì   ÿµ  H   ô   ì   ÿ   ì   ∆   ÿµ  H      ô   ì   ÿµ  H      ì	   ñ   ì
+   µ  H   ∆   ÿì   ∑   ⁄H   ›i	      p ∆   ÿ∫ 	   ∑   å p û°0 `Pµ@ `P∂0 `Pí@ `Pï P8 `P-P3 Q  \  b=≤,  C         	       B      $e   µ  H   f    ∆   ÿµ  H   ñ'   ì   ∑   ⁄H   ›   µ  H   %t ÿì   µ  H   ò   ì
+   ÿµ  H   H   ì   ñN   ì      µ  H   ⁄H   ›	   p ⁄H
+   ›   p %∆  ÿ∑   ⁄H   ›∑  t ÿì   ∑   ⁄H
+   ›   p ∆  ÿ¥   H   ô   ì   ÿ¥   H   H   ì   ñ   ì    ∑  ûì    ¶¥   ⁄H   ›∑  p H   ñ   ì&   ∑  ûì&   ï    ì&    †®™´  ÿ´  ÿ∑  †À°Àì&   µ  H   H   H   ñT   ì+   ¥   H   H   ⁄H   ›µ  H   H   µ  p %∆  ÿ∑     %∑  %   %∆  ÿì6   ¥   ⁄H   ›∑  p H   ñ   ì<   ∑  ûì<   µ  H   ñ'   ì>   ∫    µ  H   p    %∑  %ûìB   ∑  û°0 `P%í@ `Pí0 `Pô PI `PØ0 `Pô P/P9 `P/PI `Pê PH `Pñ ü@ `PD- F1 
+`Pê 	Pî0 `PD- ì@ K `PD- I `Pû0 `P¶ P: `Pü@# `Pê 	Pî0 `PD- F( `Pí0 `P.PN- F, `P4 Q    \  L     V     ˇˇˇˇ    g                   3   ∞   d√˝∞   h                 	          ∆   ÿµ  ò   ì   ÿµ  H   µ ì   ñ0   ì   µ  ⁄H   ›µ ∑   H   &p ∑   %ûï   ì	   µ  ûì	   °0 `PJ `P©0 `Pò PH K0 `PC V  T    {T$T   $                         ¥   H   H   ⁄H   ›µ  p    û°0 `Pô !P9 Q  ¥  Ç4î  ≈                %      µ ô   ì   ÿì   %∆   ÿ∫ ,      ∫ .  p ∆  ÿµ ∑  ñ   ì      ûì   µ     ñ   ì   ∫ 	   µ  µ p ûïâ   ì	   ∫ '   µ  p ñs   ì   e    ∆  ÿ∆  ÿî   ∑  µ  H   ñ<   ì   ∑  ∑  ∫    µ  ∑  Iµ ∑   p Lÿ∑  .'∆  ÿï∂ˇˇˇì   ∑  ûì   µ     ò   ì   ÿµ  ì   ñï   ì   7   ∆  ÿµ  \î   ]^óe   ì   ∆  ¥   H   H	   ⁄H
+   ›µ  ∑  p ñ,   ì"   ∑  ∑  ∫    µ  ∑  Iµ ∑   p Lÿì%   ÿïòˇˇˇì%   _∑  ûï   ì%   µ  ûì%   °0 `Põ0 `Pê 
+PH `Pí0 `PE" F	 `Pî0 `P,PC" K `P)P= `P:  `P&fPó0 `Pù PE )`Pï@ `PD" F 
+`P©0 `P: `Pñ ˇˇˇı4 `Pù  P= 
+`Pù PJ L `PD" K0 `PC" V ¥         §   O         9  m   x  äﬂ@8  e                >      $∫ ,      ∫ .  p ∆   ÿµ ∑   ñ   ì   ¥    µ p    %ûì   µ %ô   ì   ÿì   ≈ ÿ¶∫   H   ò   ì
+   ÿµ  ∫   H    ì   ñ3   ì   ¥    µ p    %¥    ∫ #   µ  p p %ûì   e    ∆  ÿµ  \î   ]^ó&  ì   ∆  µ  H   ô   ì   ÿµ  ⁄H   ›∑  p ì   ò&   ì   ÿ∑  ò   ì   ÿµ  ∑  Iì!   ñ∏   ì"   µ ñ#   ì#   µ    %∑  %   %ï   ì&   ∑  ì&   ∆  ÿµ  ∑  I∆  ÿ∑  ⁄H	   ›∑  
+   ñ#   ì+   ∫    ∑  ∑  µ p ï+   ì,   ¥    ∑  p    %¥    ∑  p %ì2   t ÿì3   ÿï◊˛ˇˇì3   _∑  ⁄H   ›p  ⁄H   ›   p ûïB   ì7    †®™´  ÿ´  ÿ¥    µ p    %¥       ∑  %p %†À°Àì>   °0 `Pê 
+PH `Pí0 `P)PI F `Pö@1 
+`P≤0 `P)Pò 6P#ˇˇˇÌPD F `P: `Pñ ˇˇˇ˜4 `P¢ PΩ0 `Pπ )`P= 
+`P+	¶ Pó Pì P)ˇˇˇ¨PI L `P+P/PC N ; `P)Pô #PD Y  x  X     *  5   ˇˇˇˇ    ]               À   .          ]   ≈    «ørT‰  P                      $µ ñ   ì   µ  ûï1   ì   µ ∫ ,      ∫ .  p ñ   ì      ûì   µ  ô   ì   ÿ7   ì   ≈  ÿµ \î   ]^ó‘   ì	   ∆   µ ⁄H   ›∑   p ñ™   ì   ¶µ ∑   IH   ¥   ñG   ì   µ  ∑   ∫ (   µ  ∑   Iµ ∑   Iµ %ô   ì   ÿì   p Lÿï   ì   µ  ∑   µ ∑   ILÿì   ï*   ì    †®™´  ÿ´  ÿµ  ∑   µ ∑   ILÿÀì   ÿï)ˇˇˇì   _µ  û°0 `P? `PC K `Pì 	P> `PE F `Pú0 `Pñ ˇˇˇı4 
+`P.P=1 `Pù0 `P≥ P?0 `P£@ ; 
+`Pó@ L `P3 Q   Ù          ˇˇˇˇ       õ   z         i   ‹   î  p≠5î                         µ     ∫    µ p %   %¥   }‹  ~  ⁄H   ›p  %%≈  ÿ¥      ò   ì   ÿ∫ &  H   ì   ñ%   ì   ∫ &  ⁄H   ›µ  µ t ÿïì   ì   ∫ ,      p ∆   ÿ∑   	   ñH   ì   ¥
+   }‹  ~  ∆  ÿ∑  ⁄H   ›   µ  t ÿ∑  ⁄H   ›t  ÿï)   ì   ¥   }‹  ~  ∆  ÿ∑  µ  J   ÿì   °0 `Pë Pî $P*P5 `P∞0 `Pí P>0 `P+
+P8 
+`Pî0 `Pí0 `Pî P4 `P+P>0 `Pí0 `Pí@ P    p  äØõ?`  Î          	             7   ∆   ÿi   ∆  ÿµ  ñ…   ì   µ  H   ∆  ÿ∆  ÿî   ∑  ∑  H   ñò   ì   ∑  ∑  I∆  ÿ∑  ⁄H   ›∑  H   p ñT   ì   ∑  H   ⁄H   ›∑  p I∆  ÿ∑   ∑  ∑  H   ô   ì   ÿ∑  H	   ì   Lÿì   ∑  .'∆  ÿïYˇˇˇì   ∑   û°0 `P: `PJ `P= `P=  `P&fPò0 `P> `Pî 
+P= `Pî P: 
+`P±@ (`Pï@ `P4 Q p         4   ¨   h  ïX‘ôh                         ∫   ô   ì   ÿ∫    ∫   p ì   «   ÿ∫ &  µ  I¥   ñ   ì   ∫ &  µ  Iï   ì   ∫   µ  ⁄H   ›p  Iì
+   ∆   ÿ∑      ñ   ì   ∆   ÿì   µ     ò   ì   ÿ∑      ì   ñ"   ì   ∑   ⁄H   ›i   p ∆   ÿì   ∑   ¥   ñ   ì   ∑   ï   ì   µ ì   û°0 `Põ P> `Pª 2P> `Pî0 `PK `Pî "ö0 `Pê PM
+ `P™0 Q    †   dô°Õ†   T                  	       µ  ô   ì   ÿµ  ⁄H   ›∫ -  p ì   ñ%   ì   ∫ %      µ  %   %t ÿûì	   û°0 `P//Pì0 `Pï P4 `PA F `P1 Q    \   ‡ÌúT\   &                        ∫ ,      p ∆   ÿ∫ ,   µ  ∑   p û°0 `P,
+P8 `P-P3 Q §  ÔÕ	Uî  °                ç      ∫ ,      p ∆   ÿ∫    ∑   p ô   ì   ÿ∫   ì   ñ   ì    ûì   ∫   &«   ÿ∫ ,         p ∆  ÿ∫ ,      p ∆  ÿ∑  ñÅ   ì
+   ∆  ÿ∆  ÿî
+   ∑  ∑  H   ñB   ì   ∑  ∑  ∑  Iñ   ì   ∆  ÿï   ì   ∑  .'∆  ÿïØˇˇˇì   ∑  ó   ì    ûì   e   µ  H   f    µ  H   f   µ  H   f   ⁄H	   ›
+   p ∆  ÿ∑  ∫   ñ   ì    ûï   ì   ∑  «   ÿì   7   7   ¥   }‹  ~  ⁄H   ›p  :   :   ∆  ÿ7   ∫   :   ∑   :   ∫ ,      p ô0   ì(   ÿ∫   H   H      %∫   H   H   %ì.   :   ∫ ,      p ô   ì1   ÿ∫   H   H   ì3   :   ∫ ,      p :   ∫ (   ∫ (   ∑  ∫ ,      p p µ p :   ∑  :   ∫ ,      p :   ∫   H   H   :   ¥   H    :    ¥   H!   ô   ìF   ÿ¥   H"   ìH   :!   µ  H#   :#   µ  H   :   µ  H   :   µ  H   :   µ  H$   :$   µ  H%   :%   µ  H&   :&   ∫ +  :'   (   :)   ∆  ÿµ  H#   ∆  ÿ∑  ò   ì[   ÿ∑  µ H*   ì]   ∆	  ÿ∑	  ñ5   ì^   ∑  ¥+   }∑	  ‹  ~ J#   ÿ∑  H#   J,   ÿìc   ∫ &  H-   ∆
+  ÿ∑
+  .   ñ6   ìg   ∑
+   ∑  ∑  H   p ∆  ÿ∑  ñ   ìk    ûìk   ∑  H#   ∆  ÿ∑  ò-   ìm   ÿ∑  H,   ò   ìp   ÿ∑  µ H*   ìr   ∆  ÿ∑  ñ6   ìs   ∑  ∑  J#   ÿ∑  7/   0   :1   J2   ÿïm   ìw   ∑	  ñ6   ìx   ∑  ∑  J#   ÿ∑  73   4   :1   J2   ÿï.   ì|   ∑  µ H*   J#   ÿ∑  µ H2   J2   ÿìÄ   ∑  µ H5   J5   ÿ∑  H%   ò#   ìÖ   ÿi6   ⁄H7   ›∑  H   p ìà   ñ   ìâ   ∫ %   8   p ûìä   ∫    ∫ ,   9   p ô   ìå   ÿ∫ !  ìå   ∑  t ÿ°@ `P+
+P8 `P*P/ï0 `PAt F `PG
+ `Pê 
+P8 `P+
+P8 `P> `P6  `P&fPò0 `Pò0 
+`P6 
+`PJ 6`Pï@ 
+`P> `PAt F `P%--ô P8 `Pî0 `PAt K 0 `PO$ `P5 %
+*P*Pí@* `P5 J- 9 +PΩ0 +	Pß0 +P8 õ ,P#ˇˇˇ‰P&ˇˇˇ˙P8 9 +PH5 î0 ? ©@9 M; = = = = = = : OF `P=  `P¶@K `P> `Pí P9 `Pï@Q `P? `Pï0 `Pí P8 
+`Pê0 `PAt FZ `P> `P/¨@] `PN_ `P> `P)ö0 `PNc `P> `P)ö0@g `Pí0 `Pó@l `Pí@n `P´ 0Pí0 `P+PCt Fs `Pë Pú ˇˇˇˇP4 P   §         ö   V   ¨  &ﬁ≈\  Æ     	                 $’∆  ÿ
+∆  ÿ   ∆  ÿ¶¥   }   ‹  ~ £ï5   ì    †®™´  ÿ´  ÿ   ∆   ÿ∫ "   ∑  p ∆  ÿÀì   ∑  ó5  ì      ∆   ÿe    ∆  ÿ¶∑  H   H   H   ∆  ÿî   ∑  ò   ì	   ÿ∑  H	   ∑  ì   ñç   ì   ∫   ⁄H
+   ›∑  ⁄H   ›p  p ñ-   ì   ¥   H   ô   ì   ÿ∑  ì   ï   ì   ∑  ì   ∆  ÿ∑  ⁄H   ›∑  t ÿ∑  H   ∆  ÿïPˇˇˇì   ï'   ì    †®™´  ÿ´  ÿ∫ %   ∑  t ÿÀì   ∑  ⁄H   ›   p ∆  ÿì   ∑   ∑  %û°60 `P7 )`PJ1 `P/Pë0 ; `P: `P*PN `P> `P: `P:1 `Pò0 fP¨0 `Pó P#ˇˇˇˆP√0 
+`P/P4 
+`P•@ ; `P*PJ `Pê PM$ `P9 Q    ¨  |     8   (   ˇˇˇˇ   g     ˇˇˇˇ                     †   µ           à   ◊   d   ≈Wd   5                         µ  H   ô&   ì   ÿµ  H   ô   ì   ÿµ  H   ì   û°0 `P≥0 Q    ∞  ıV–†  &                       µ  ñ  ì   µ  H   ∆   ÿ∑   ñÙ   ì      µ  H   ⁄H   ›p  %∆  ÿ∆  ÿî   ∑  ∑   H   ñû   ì
+   ∑   ∑  IH   ò)   ì   ÿ∑   ∑  IH   ⁄H   ›p     ì   ñC   ì   ∑  	   ∑   ∑  IH
+   %   %∑   ∑  IH   %   %%∆  ÿì   ∑  .'∆  ÿïSˇˇˇì   ∑     %ûï   ì   µ  H   ûì    °0 `P= `PM 
+`P> `Pî P9  `P&fPò0 `PÆ !Pò0 `P≥K *`Pï@ `PJ K@ `PH V ∞         K   ≤   \   á7[[\   #                          ∫   %«   ÿ∫   ⁄H   ›j   t ÿ°0 `P7 `Pë PD P    <   µÂQ<                             ∫   &«   ÿ°0 `P7 P   ‡   uê{Á‡   î                       ∂  «   ÿ∂ «   ÿ∫   ∫   I«   ÿµ  ∫   p ∆   ÿ∫   ∫   ∑   Lÿ¥      ò   ì   ÿ∫  H   ì   ñ$   ì	   ∫  H   ⁄H   ›j   t ÿì   °í0 `Pë0 `P)P8 `Pê@ `P∞0 `Pñ PI
+ P @   –ˇ!∑@                             ∫   ∫   ∫   Lÿ°0 `Pë0 P   x   Œ$Tôx   ;   	                     ∂  «   ÿ¥      ñ   ì   ∫&  ∫   J   ÿì   j   û°I 
+`Pñ0 `Pï@ `PEC Q       qz                 C       ’∆  ÿ∫,      p ∆   ÿ7   ∆  ÿµ ò   ì   ÿ∫  H   ì   ñ   ì   ∫  H   H   ≈ ÿì   ∫   ∑  t ÿ«  ÿ∑   ò   ì
+   ÿ∫  ì   ñ  ì   ∑  H   ñÆ   ì   µ  ò   ì   ÿµ  H   ì   ñ   ì      µ  H   %ï   ì   	   ì   ∆  ÿµ  ò   ì   ÿµ  H
+   ì   ñ   ì   µ  H
+   ï   ì   ¥   ì   ∆  ÿ∑  µ  J   ÿïG   ì   µ ò   ì   ÿµ H   ì   ô   ì   ÿ	   ì   ∆  ÿµ  ∆  ÿì   ∫)   7   ∑  :   ∑  :   µ :   µ :   µ :   µ ò   ì$   ÿ∫"   µ p ì%   ô   ì&   ÿ∫   p  ì'   :   ∑  7      :   :   7      :   :   t ÿ∫      p ñ_   ì1   ∫&  ⁄H   ›7      :   ∑  :   7      :   µ :   ∑  :   µ :   :    t ÿì<   ¥!      ñ   ì@   ∫&  H"   «   ÿìA   ∫   ñ#   ìB   ∫    µ  µ µ µ µ t ÿìC   °6 `P,
+P8 `PJ `P®0 
+`Pò@	 `P*P4 `PG `P/ï00 `Pï@ `PÃ0 `P∆0 `Pó00 `Pµ0 `PM 
+`P; 9 9 8 8 8 ó Pô 'P=9 : 6 %O PD& `P+P= `Pë0 : 9 5 : 8 9 M' PI4 `Pñ0 
+`Pï@9 `P? 
+`Pï PI< P  @   ·ÿü@      	                      ∂  «   ÿj   û°I `PE Q    Ï   pöÏ   í                       ∂  «   ÿ’∆   ÿ∫      ñZ   ì   ∫   ∫   p «   ÿ¥   H   H   ⁄H   ›∑   p «   ÿ∫   j   µ p ûï   ì
+   ∫   ∫   µ p ûì   °? `Pñ0 
+`P+P9 `Pú P9 
+`PKC PC
+ K0 
+`P.PC
+ V   P   ë·dÔP                            ◊∆   ÿ∫   ⁄H   ›∑   ∫   t ÿ°6 `Pï P4 
+P  <   HÓ™<      	                      ∂  «   ÿj   û°9 `PE Q L   :ÁT/L                            ∫    ∫   µ  p p û°0 
+`P/P#ˇˇˇ˘P3 Q  <   –Wƒ<      	                      ∂  «   ÿj   û°9 `PE Q †   ∫15Ù†   ]         	       
+        ’∆  ÿ◊∆  ÿ¥   H   H   ⁄H   ›∑  p ∆   ÿ∑   ∫   ∑   Ip Lÿ∫   ⁄H   ›∑  ∑   p û°< `Pö P8 
+`Pë 
+P5 
+`Pî P3 Q   l  ≠Õül  ›         	       ,       ∫ ,      p ñ»  ì   µ  H   ∆   ÿ∑   ó   ì   7   ∆   ÿì   7   ∆  ÿ∫    ∑  t ÿ∑   H   ó   ì	   ∑  ∑   J   ÿì
+   ∫ )   7   ∑   H   ñ   ì   ∑   H   ï   ì   	   ì   :   ∑   H   ñ   ì   ∑   H   ï   ì   
+   ì   :   ∫ "   ∑   p ô   ì   ÿ∫    p  ì   :   ∑   H   ô   ì   ÿ∑   H   ì   :   ∑   H   ô   ì   ÿ∑   H   ì   :   ∑   H   ñ   ì!   ∑   H   %ï   ì#   ¥   ì$   :   ∑  7      :   :   7      :   :   t ÿì,   °0 `P,
+P= `P= `P> `PO `P: 
+`P*P4 `Pì0 `Pì@ 
+`P; µ0 µ0 *Pî  P= ß0 ß0 ∑09 : 6 %O PI P   Ù   ¥BëËÙ   ß                        ∫   µ  Iò   ì   ÿ∫   µ  IH   ì   ∆   ÿ∑   ò2   ì   ÿ∑   H   ò   ì   ÿ∑   ⁄H   ›   p ì	   ñ:   ì
+   ∫    ∑      j   t ÿ∫    ∑      j   t ÿì   °0 `P¨0 
+`P≥ 3Pí0 `Pî PD `Pî PI P    <   ~Öá3<      	                      ∂  «   ÿj   û°9 
+`PE Q    ˛î‡   °         	       
+      $◊∆   ÿ¶µ ò   ì   ÿµ H   ì   ñ$   ì   µ ∫   µ H   p J   ÿì   ï'   ì    †®™´  ÿ´  ÿ∫%   ∑  t ÿÀì   ∫   ⁄H   ›∑   µ  ∫   µ p µ µ p û°F1 `P•0 `Pë Põ@ K
+ `P*PJ `Pú P)ˇˇˇÚP3 
+Q           X      ˇˇˇˇ           I   <   0‹ö@<      	                      ∂  «   ÿj   û°9 
+`PE Q ê   üà4ê   P                       ◊∆   ÿ∫   ⁄H   ›∑   µ  µ µ µ t ÿ∫   ⁄H   ›∑   µ  ∫   µ p µ µ p û°6 `Pú P4 `Pú P)ˇˇˇÚP3 
+Q   4   ∂^64                              ∫ &  û°0 `P5 Q   3ıÿ  `«  .      `     `L     @  @.      è   "  !  
+  	  B       @4  #  %    @M  «  &    `  H  	  p  `  `V  ≠  	  `[  \  +    @8  «  ]  .    @W  X      `  pQ  ^    `d  +    @  «  e  .    @    j  =  3     f        `    `j    `4    `  p  q    j  =  3     `  p  q    j  =  3     `d  g      pj    p4    p√     pn    p  `d  g    j  4  √   n  
+  `  pg      j  4  √   n    p_    p`  d    `^  #  v     `w  x    @•   X )  y  	  @5  «  z  .      `
+  @5  «  |  .    `  @5  «  ~  .    `  @5  «  Ä  .    `  @5  «  Ç  .    `  @5  «  Ñ  .    `)  à  [  y    @5  «  â  .    @•   X ã  †  ä  å      `é    `ê    `í  +       `%  p   `í  ã  é  ê  !  `í  ã  é  ê    `  p  p  p  p  p  p   p!  p"  p#  p$  pã  †  é  ì  ê  &  pr  '  ps  Q  ñ  ó  ò  ô  ö  Ñ  í  "  `#  `¶  I  Ü  ¨  Ö    $  `  @≠  Ø  ∞  v   Æ  Ö  &  `     %  `4  p'  `ø  g      ¿  (  `)  `≈  ∆  v   «  «  »  Ê  Z    P*  `À  ç A  #  Ã    .  ^       v   ¶  Œ    j  œ  +  `–  —  3   “  )  ”  ,  `’    =  -  `  j  º  3   B  .  `€  ‹          @  j  œ   3   /  `€  y   ‚  „  =  œ   [  ]  A    Ê    &  0  `v   1  `€  ‹    @œ   K     2  `3  `?  È    0  Í    Î  Ï  Ì  Ó  Ô    Ò  Û  ≠  4  `  @  P˙    Æ  ¸  Y  Ê  ˝  5  `    ã      ^    P6  `Y   '  7  ` 8  ` 	 
+    .        |    @  @  0      @  )      à  8      ‡         !  
+  B     3   #           @$ «  &    @ %    PÆ  & ' 9  `+   v   :  `, - 5   6     Æ  º    Å A  ;  `  
+  <  `ö  0   =  `˙  <  ¸      Ê  º  >     .  1 "  >  ?  `>  `2 H  pA  `@  `Í    : A  J  pB  `    C  `D  `      W        @  @.        è   "  !  
+  	  B       @$  #  %    @'  «  &  E  `(    @.      )  º  !  
+       @$  #  %  !  @*  «  &  F  `-  "  @«  /  .    0  ≤      #  @  $  @  2  4    5  6  7  †  8    :  ;  '  =  P     ?    A  G  `H  `I  `J  `K  `ú  L  `ú  M  `V  N  `V  O  `û  _  õ  r  P  `ü  `  ù  s  Q  `£  R  `£  U  `V  `L  %  @T  ?   «  @ A B   .  &  @  !  
+  B     '  @4  #  %  (  @M  &  ú  +  )  @*  @  	    Í  < T  `Í    < L  pY  `   X  `    j  =  3   O  pW  `N  p[  `Z  `Q  p]  `  j  =  3      \  `S  p^  `£  p  +  @,  @  J -  @.  K v     è   "  !  
+  	  B     .  @4  #  %  /  @L «  &  a  `Q b  `3   `  `W  pd  `3   c  `Y  p_  `j  œ   Q  V  pR X  pe  `  `  p  p
+  p  p  p0  p1  p2  p3  p5  p6  p7  p8  p9  p:  p;  p<  p=  p>  p?  p@  pA  pB  pC  pD  pE  pF  pG  pI  p  @
+      p    p    p    p    p+  Q      p_    p`    pr    ps  (  põ  )  pù  *  pû  +  pü  ,  p†  -  p°  .  p¢  /  p§  ¶  ß  ®  Ñ  ö  ™  ´     P  P∂  ‹ π  ¨  Ö    Á  3 4 Æ  5 S  `L  ; K  pM  p2 D E P  pF R  pG H T  pM Z    PU  p 0  @5  «  S .    T   U Z  p'    V    `  p     ˇXÑA                »  y           † Ô     X     † Ú     Y     † Û     Z     †      [     † "  !   \     †        >      †        F      †        ]     † 1      R      †  !      S      †
+ C     _     † D     `     † r      a      †  5      b      †  ]      b     † G      c     † I      c     † K      c     † M      c     † U      c     † j      d     † E     e     † F     f     † ÷      t      †  Ä      u      †  Ñ      v      †  í      {      †  ò      }      †  û            †  §      Å      †  ™      É      †  ∞      Ö      †  ¬      ç      †  ƒ      è      †         ë      †  ∆      r     † Ã      s     † —      t     † G     u     † I     v     † K     w     † M     x     † O     y     † T     z     † Y     {     † [     |     † Û      ©      †  Ù      J      †  ˚            †       o      †       }     †            †       E      †    
+   Y      †       Z      †  1     @      †  5     ÷      †  ;     B      †  F     √      †  V     1      †  ^     7      †  n  
+   Ù      †  x     K      †  Ä          †  Ñ     U      †  Ü  :         †  ¿            †  “           †  ÷     ‰      †  Â     N      †  ‰     ~     † È     6     †  Ë          † Ä             † ]  #   H      † é     C     †
+ á     Ä     † Ö     Å     † ë             † ê             † ô             † ì             † õ             † ¿             † ∫             † ∂             † æ             † º             † «             † ùH©¿      ‰≤      ‰≤                 Äü  …≤  ñ  …≤     
+            ö    í    ,                È  	  ·  	  =                c  ﬂ  Z  ﬂ  T   "            á    ~    É               2  ˇ  *  ˇ  •   !               –    –  ‡             Äé!  ±)  Å!  ±)                ["  ö(  R"  ö(  ˜   "            K*  ’-  -*  ’-  +                °*  ô-  ô*  ô-  0              *.  /.  ".  /.  O  .             `.  e.  X.  e.  P  /           ÄŒ.  «5  Æ.  «5  S  "             Ë.  ,0  ◊.  ,0  U             ≈1  24  Ω1  24  p  0             2  K2  2  K2  s  &             v2  ß2  n2  ß2  w  '             ”2  3  À2  3  {  (             13  ì3  )3  ì3    (             »3  *4  ¿3  *4  É  1             f4  W5  ^4  W5  à  1             6  $6  6  $6  ò  1             X6  ]6  P6  ]6  ô  2           Ä∫6  ÃD  ó6  ÃD  ú  %             ÷6  	7  ƒ6  	7  û              '7  —8  7  —8  ¢              Ì8  J9  ◊8  J9  ∂               f9  ¿9  P9  ¿9  Ω               ‹9  5:  ∆9  5:  ƒ               M:  ß:  ;:  ß:  À               À:  *;  ≠:  *;  “  "             I;  ®<  0;  ®<  Ÿ              ≈<  =  Æ<  =  Á              ?=  ú=  %=  ú=  Î            Äˆ=  ∆>  ‚=  ∆>                >  ø>  >  ø>  Ò               Ö@  {A  }@  {A  	  3             —A  áB  …A  áB    4             ˚D  *E  ÛD  *E  $  -             [E  ãE  SE  ãE  (  .             ªE  ÍE  ≥E  ÍE  ,  -             F  KF  F  KF  0  .             uF  "G  mF  "G  4  '             MG  ˛G  EG  ˛G  ;  (             2H  eH  *H  eH  B  1             öH  ŒH  íH  ŒH  F  2             ÙI  #J  ﬁI  #J  R               âL  êM  pL  êM  c               ∞M  ÑN  îM  ÑN  n            ÄºQ  ¡R  ¨Q  ¡R  ê             %R  ºR  R  ºR  í               wS  NT  kS  NT  ù              âT  ÀT  yT  ÀT  ß              	U  ˝U  ¯T  ˝U  ¨              UV  ,[  CV  ,[  ∏              A[  \  0[  \  Á              \  j\  
+\  j\  Ò              ¥\  ê`  ü\  ê`  ˆ              ja  ¬d  Xa  ¬d                ‰e  1h  ÷e  1h  >              0j  l   j  l  ]              0m  Oo   m  Oo  r              Êo  ¥q  ”o  ¥q  â              r  ∞r  ˝q  ∞r  ó              ªs  &t  ûs  &t  £              _t  ,Ö  It  ,Ö  ©              /Ü  Sã  Ü  Sã  "               ®ã  å  àã  å  J  "            iå  Bé  Rå  Bé  O             Íé  Pè  –é  Pè  d               &è  Jè  è  Jè  f             Äbë  Öí  Që  Öí                Oí  yí  Fí  yí  Ö              Ä‡ì  ºú  ◊ì  ºú  ì  )            ®î  µú  òî  µú  ô            Ä‚ú  îü  Ÿú  îü  ÿ  "          Änû  çü  eû  çü  ﬂ             ü  Fü  ü  Fü  „  !           Äb†  Õ†  Y†  Õ†    9            Ö†  ƒ†  |†  ƒ†  Ò            Ä&°  Í°  °  Í°  ¯  0           I°  ·°  @°  ·°  ˘               ú¢  ,¶  ì¢  ,¶    =           ©  [Æ  ©  [Æ  !  ©         Ä™  “¨  ˙©  “¨  $  9           (™  «¨  ™  «¨  %            Ä}≠  KÆ  t≠  KÆ  7  <           ¢≠  @Æ  ô≠  @Æ  8              ≤  :≤  ≤  :≤  V             5°›µápÃ"© »      _e ùe ùF£8e7˛   K    O^partitionKey=%28https%2Clever.co%29,:https://jobs.lever.co/js/bug-snag.js strongly-framed 1 security-info FnhllAKWRHGAlo+ESXykKAAAAAAAAAAAwAAAAAAAAEaphjojH6pBabDSgSnsfLHeAAAAAgAAAAAAAAAAAAAAAAAAAAEAOQFmCjImkVxP+7sgiYWmMt8FvcOXmlQiTNWFiWlrbpbqgwAAAAAAAAYQMIIGDDCCBPSgAwIBAgIQDFeCXFhSatUvxSXMTiz8yTANBgkqhkiG9w0BAQsFADA8MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRwwGgYDVQQDExNBbWF6b24gUlNBIDIwNDggTTAxMB4XDTIzMDQwOTAwMDAwMFoXDTI0MDUwNzIzNTk1OVowEzERMA8GA1UEAxMIbGV2ZXIuY28wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC57OJ7GDHyXap41tAbl7AB8f7ar7R1DarO5Y8qJmJqU94wYg3h/q9+1R8wAYWSa4R4VmYkbcnvicAoazgcPx5TnwKe2Pc3U6OgqXCSZb/D5TYJzuhTQXInMuzR0fdZfztXk1CylUsbRY//1qC+7gWFXSHvt2sA47+rD6WJWx24NEZIXq7HgFS3kB3aMH78EIiIWiVoOGuDZUJGBXXYbBWaJPQ/0IUQax9N+eiMEULJtebT5f8AofVkijNI8ye8+t174nl9mIU+a1jZhTRBx7nF54NX2wc2YVy5sDpUf5DfZhJ9Z9fbuMoHq4nlz0MZu8/PVyD+gGWX+noCX0EL7DfxAgMBAAGjggMxMIIDLTAfBgNVHSMEGDAWgBSBuA5jiokSGOX6OztQlZ/m5ZAThTAdBgNVHQ4EFgQUqYlJQdxSMI9efwU++vIKC0iT/2QwZAYDVR0RBF0wW4IIbGV2ZXIuY2+CDWhpcmUubGV2ZXIuY2+CDyouaGlyZS5sZXZlci5jb4IQdGFibGVhdS5sZXZlci5jb4IRKi5tLmhpcmUubGV2ZXIuY2+CCioubGV2ZXIuY28wDgYDVR0PAQH/BAQDAgWgMB0GA1UdJQQWMBQGCCsGAQUFBwMBBggrBgEFBQcDAjA7BgNVHR8ENDAyMDCgLqAshipodHRwOi8vY3JsLnIybTAxLmFtYXpvbnRydXN0LmNvbS9yMm0wMS5jcmwwEwYDVR0gBAwwCjAIBgZngQwBAgEwdQYIKwYBBQUHAQEEaTBnMC0GCCsGAQUFBzABhiFodHRwOi8vb2NzcC5yMm0wMS5hbWF6b250cnVzdC5jb20wNgYIKwYBBQUHMAKGKmh0dHA6Ly9jcnQucjJtMDEuYW1hem9udHJ1c3QuY29tL3IybTAxLmNlcjAMBgNVHRMBAf8EAjAAMIIBfQYKKwYBBAHWeQIEAgSCAW0EggFpAWcAdgDuzdBk1dsazsVct520zROiModGfLzs3sNRSFlGcR+1mwAAAYdjlnD8AAAEAwBHMEUCIFfpfoqkgEE0YmF/dcg+4MLMvWyeuQWprPqTT+FLXDP4AiEAo/z7er2rxJxtRK9OiGZYazE7IH1keANvNmZ/TXMYrrIAdQBz2Z6JG0yWeKAgfUed5rLGHNBRXnEZKoxrgBB6wXdytQAAAYdjlnFAAAAEAwBGMEQCIBoE6nKWjpYpjgt3Wsjtzv+3Dki0REOOP0xP/wHlgOOTAiB6I5rgNrNBg5IiFY/6Ewa07V/1xdCqCN/wl6kWDbNnKgB2AEiw42vapkc0D+VqAvqdMOscUgHLVt0sgdm7v6s52IRzAAABh2OWcR0AAAQDAEcwRQIhALSMkcXUXCX/vQLjbQpAuthU52fG71KG8aIKGamjWqD2AiAUUeKJJqqlHTwQjQH9rz4woEPvhG9dI6N0vF/8OZagcDANBgkqhkiG9w0BAQsFAAOCAQEAGlbVeMTSfD4smljZIkG5B+eXFSj+FSBXoyp/z2SlZ6FxSF0Y33mdb0RFnBRgrdLmEUcZHqjiTSjtQ//R2NYEit5JvDB2p6JQFp8On0aRTcuhikE94exmtbiBc6Sy0eEr5T4vICEOXUne7NysxX600MrclQq6XGU55HrGOADq8bW0dwOA2j5+XAkciBr4w7uDo0ZFMCaUFPNOQieYgF1lGebQ8hR9WGgmJwuyklhHUPcSXt2LcoKUJQM4fVpG9pEEbsWjWgzrUgUbKnceCNa/9uXJTao5f9w1YghnsMqx1FPeCl8agMGOijP48EmxZdlWbNrIDa8fJ3FXRaS0fwQNtMAvAAMAAAAAAAEBAAAAAAAABFAyNTYAAAAQUlNBLVBLQ1MxLVNIQTI1NgADZgoyJpFcT/u7IImFpjLfBb3Dl5pUIkzVhYlpa26W6oMAAAAAAAAGEDCCBgwwggT0oAMCAQICEAxXglxYUmrVL8UlzE4s/MkwDQYJKoZIhvcNAQELBQAwPDELMAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEcMBoGA1UEAxMTQW1hem9uIFJTQSAyMDQ4IE0wMTAeFw0yMzA0MDkwMDAwMDBaFw0yNDA1MDcyMzU5NTlaMBMxETAPBgNVBAMTCGxldmVyLmNvMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAueziexgx8l2qeNbQG5ewAfH+2q+0dQ2qzuWPKiZialPeMGIN4f6vftUfMAGFkmuEeFZmJG3J74nAKGs4HD8eU58Cntj3N1OjoKlwkmW/w+U2Cc7oU0FyJzLs0dH3WX87V5NQspVLG0WP/9agvu4FhV0h77drAOO/qw+liVsduDRGSF6ux4BUt5Ad2jB+/BCIiFolaDhrg2VCRgV12GwVmiT0P9CFEGsfTfnojBFCybXm0+X/AKH1ZIozSPMnvPrde+J5fZiFPmtY2YU0Qce5xeeDV9sHNmFcubA6VH+Q32YSfWfX27jKB6uJ5c9DGbvPz1cg/oBll/p6Al9BC+w38QIDAQABo4IDMTCCAy0wHwYDVR0jBBgwFoAUgbgOY4qJEhjl+js7UJWf5uWQE4UwHQYDVR0OBBYEFKmJSUHcUjCPXn8FPvryCgtIk/9kMGQGA1UdEQRdMFuCCGxldmVyLmNvgg1oaXJlLmxldmVyLmNvgg8qLmhpcmUubGV2ZXIuY2+CEHRhYmxlYXUubGV2ZXIuY2+CESoubS5oaXJlLmxldmVyLmNvggoqLmxldmVyLmNvMA4GA1UdDwEB/wQEAwIFoDAdBgNVHSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwOwYDVR0fBDQwMjAwoC6gLIYqaHR0cDovL2NybC5yMm0wMS5hbWF6b250cnVzdC5jb20vcjJtMDEuY3JsMBMGA1UdIAQMMAowCAYGZ4EMAQIBMHUGCCsGAQUFBwEBBGkwZzAtBggrBgEFBQcwAYYhaHR0cDovL29jc3AucjJtMDEuYW1hem9udHJ1c3QuY29tMDYGCCsGAQUFBzAChipodHRwOi8vY3J0LnIybTAxLmFtYXpvbnRydXN0LmNvbS9yMm0wMS5jZXIwDAYDVR0TAQH/BAIwADCCAX0GCisGAQQB1nkCBAIEggFtBIIBaQFnAHYA7s3QZNXbGs7FXLedtM0TojKHRny87N7DUUhZRnEftZsAAAGHY5Zw/AAABAMARzBFAiBX6X6KpIBBNGJhf3XIPuDCzL1snrkFqaz6k0/hS1wz+AIhAKP8+3q9q8ScbUSvTohmWGsxOyB9ZHgDbzZmf01zGK6yAHUAc9meiRtMlnigIH1HneayxhzQUV5xGSqMa4AQesF3crUAAAGHY5ZxQAAABAMARjBEAiAaBOpylo6WKY4Ld1rI7c7/tw5ItERDjj9MT/8B5YDjkwIgeiOa4DazQYOSIhWP+hMGtO1f9cXQqgjf8JepFg2zZyoAdgBIsONr2qZHNA/lagL6nTDrHFIBy1bdLIHZu7+rOdiEcwAAAYdjlnEdAAAEAwBHMEUCIQC0jJHF1Fwl/70C420KQLrYVOdnxu9ShvGiChmpo1qg9gIgFFHiiSaqpR08EI0B/a8+MKBD74RvXSOjdLxf/DmWoHAwDQYJKoZIhvcNAQELBQADggEBABpW1XjE0nw+LJpY2SJBuQfnlxUo/hUgV6Mqf89kpWehcUhdGN95nW9ERZwUYK3S5hFHGR6o4k0o7UP/0djWBIreSbwwdqeiUBafDp9GkU3LoYpBPeHsZrW4gXOkstHhK+U+LyAhDl1J3uzcrMV+tNDK3JUKulxlOeR6xjgA6vG1tHcDgNo+flwJHIga+MO7g6NGRTAmlBTzTkInmIBdZRnm0PIUfVhoJicLspJYR1D3El7di3KClCUDOH1aRvaRBG7Fo1oM61IFGyp3HgjWv/blyU2qOX/cNWIIZ7DKsdRT3gpfGoDBjooz+PBJsWXZVmzayA2vHydxV0WktH8EDbRmCjImkVxP+7sgiYWmMt8FvcOXmlQiTNWFiWlrbpbqgwAAAAAAAARiMIIEXjCCA0agAwIBAgITB3MSOAudZoijOx7Zv5zNpo4ODzANBgkqhkiG9w0BAQsFADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6b24gUm9vdCBDQSAxMB4XDTIyMDgyMzIyMjEyOFoXDTMwMDgyMzIyMjEyOFowPDELMAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEcMBoGA1UEAxMTQW1hem9uIFJTQSAyMDQ4IE0wMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAOtxLKnLH4gokjIwr4pXD3i3NyWVVYesZ1yX0yLI2qIUZ2t88Gfa4gMqs1YSXca1R/lnCKeTepWSGA+0+fkQNpp/L4C2T7oTTsddUx7g3ZYzByDTlrwS5HRQQqEFE3O1T5tEJP4tf+28IoXsNiEzl3UGzicYgtzj2cWCB41eJgEmJmcf2T8TzzK6a614ZPyq/w4CPAffnAV4coz96nW3AyiE2uhuB4zQUIXvgVSycW7sbWLvj5TDXunEpNCRwC4kkZjK7roljtT2cbb7W2s4Bkg3R42G3PLqBvt2N32e/0JOTViCk8/iccJ4sXqrS1uUN4iB5NmvJK74csVl+0u0UecCAwEAAaOCAVowggFWMBIGA1UdEwEB/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgGGMB0GA1UdJQQWMBQGCCsGAQUFBwMBBggrBgEFBQcDAjAdBgNVHQ4EFgQUgbgOY4qJEhjl+js7UJWf5uWQE4UwHwYDVR0jBBgwFoAUhBjMhTTsvAyUlC4IWZzHshBOCggwewYIKwYBBQUHAQEEbzBtMC8GCCsGAQUFBzABhiNodHRwOi8vb2NzcC5yb290Y2ExLmFtYXpvbnRydXN0LmNvbTA6BggrBgEFBQcwAoYuaHR0cDovL2NydC5yb290Y2ExLmFtYXpvbnRydXN0LmNvbS9yb290Y2ExLmNlcjA/BgNVHR8EODA2MDSgMqAwhi5odHRwOi8vY3JsLnJvb3RjYTEuYW1hem9udHJ1c3QuY29tL3Jvb3RjYTEuY3JsMBMGA1UdIAQMMAowCAYGZ4EMAQIBMA0GCSqGSIb3DQEBCwUAA4IBAQCtAN4CBSMuBjJitGuxlBbkEUDeK/pZwTXv4KqPK0G50fOHOQAd8j21p0cMBgbGkfMHVwLU7b0XwZCav0h1ogdPMN1KakK1DT0VwA/+hFvGPJnMV1Kx2G4S1ZaSk0uU5QfoiYIIano01J5k4T2HapKQmmOhS/iPtuo00wW+IMLeBuKMn3OLn005hcrOGTadhcmeyfhQP7Z+iKHvyoQGi1C0ClymHETx/chhQGDyYSWqB/THwnN15AwLQo0E5V9ESJlbe4mBlqeInUsNYugExNf+tOiybcrswBy8OFsd34XOW3rjSUtsuafd9AWySa3hxRRrwszrzX/WWGm6wyB+f7C4ZgoyJpFcT/u7IImFpjLfBb3Dl5pUIkzVhYlpa26W6oMAAAAAAAADRTCCA0EwggIpoAMCAQICEwZsn8+Zv4wKOeLweIpD5pY2W8owDQYJKoZIhvcNAQELBQAwOTELMAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJvb3QgQ0EgMTAeFw0xNTA1MjYwMDAwMDBaFw0zODAxMTcwMDAwMDBaMDkxCzAJBgNVBAYTAlVTMQ8wDQYDVQQKEwZBbWF6b24xGTAXBgNVBAMTEEFtYXpvbiBSb290IENBIDEwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCyeIBxynjV43GvR4BQdH1u2NeIdvSZaPdYIWD5dIQBL6wCLYbToEN6TrKk0Da6Ab6N20jIBxc2TPTuiCPHPus39bUZ+ElosN7XuXY4HWGepP6CNqXlSlbkReH5/bQW+nTanJs1OS/6sCBQBmx60ICypvmv7EcZj1A4B9yihzlY+LrVqflIZzCW7pR4Xm+Jo1HAMIZmoUVmulTro8OR+Ujc/9HoMC19LXRwNdeIJPeexFluu3OHF/IyRii4Q/q3HarKtPKfJA4tS/dxXF5p/+qVAss4iq5QOG/b+y1iG8XHHlThd+BnyA+chyPWP0AgfyCAxIBMPjskJo4ErmyayKoNAgMBAAGjQjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgGGMB0GA1UdDgQWBBSEGMyFNOy8DJSULghZnMeyEE4KCDANBgkqhkiG9w0BAQsFAAOCAQEAmPI3WkGQoRrFdlEoIDYjDq7mKLuq+JSuSKQwfxv8JI1LtMihl/a28XpwyFOTzAgo45glzyOk+d4h03yFCa1OmnU6wgtqiXh2REcYZWyNQY47f5rL9LWnUNcFLDfoA0ut6WGgAm718vDFsu1bt9z6lFx3nhOlf1KtlfL4kzvei1xbylpSW2CvFPdL76P7n0CVbTFU/ELTx0YfI63ZD0hwmtl1eHHRckM0dW5XWcICXCZgKc8jGRaOiEOl1OTLCPsjEUPoQylyYqGpXV4I1JCuuNjOFMLQVfKG9sSTQ3dmYcC56EHXl3hgA25Kcq6l0X26EJ6GbBuKuVkz+OvEkL7xuQAAAAEAAAAAAAEAAAAASHRsc2ZsYWdzMHgwMDAwMDAwMDpqb2JzLmxldmVyLmNvOjQ0M15wYXJ0aXRpb25LZXk9JTI4aHR0cHMlMkNsZXZlci5jbyUyOQEA request-method GET response-head HTTP/1.1 200 OK
+Content-Type: application/javascript; charset=UTF-8
+Content-Length: 45796
+Strict-Transport-Security: max-age=15552000; includeSubDomains
+ETag: W/"b2e4-18a6b863480"
+Date: Tue, 12 Sep 2023 04:18:12 GMT
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1; mode=block
+Accept-Ranges: bytes
+Cache-Control: public, max-age=86400
+Last-Modified: Wed, 06 Sep 2023 17:24:32 GMT
+X-Stream-Path: djobs
+ original-response-headers Date: Fri, 08 Sep 2023 16:46:05 GMT
+Content-Type: application/javascript; charset=UTF-8
+Content-Length: 45796
+Connection: keep-alive
+Strict-Transport-Security: max-age=15552000; includeSubDomains
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1; mode=block
+Accept-Ranges: bytes
+Cache-Control: public, max-age=86400
+Last-Modified: Wed, 06 Sep 2023 17:24:32 GMT
+ETag: W/"b2e4-18a6b863480"
+X-Stream-Path: djobs
+ ctid 2 uncompressed-len 0 net-response-time-onstart 342 net-response-time-onstop 983 alt-data 1;45796,javascript/moz-script-bytecode-20230512001631-8l alt-data-from-child 1  .¥
